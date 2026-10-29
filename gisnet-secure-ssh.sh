@@ -39,7 +39,7 @@
 # =============================================================================
 set -euo pipefail
 
-VERSION='2.0'
+VERSION='2.1'
 SELF_INSTALL=/usr/local/sbin/gisnet-secure-ssh
 STATE_DIR=/etc/gisnet-secure-ssh
 REPORT_CONF="$STATE_DIR/report.conf"
