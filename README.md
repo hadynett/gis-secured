@@ -21,7 +21,7 @@ Mendukung **Debian, Ubuntu, AlmaLinux / Rocky / RHEL / CentOS / Fedora, openSUSE
 Login ke server sebagai root (atau pakai `sudo`), lalu:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/hadynett/fail2ban/main/gisnet-secure-ssh.sh -o gisnet-secure-ssh.sh
+curl -fsSL https://raw.githubusercontent.com/hadynett/gis-secured/main/gisnet-secure-ssh.sh -o gisnet-secure-ssh.sh
 sudo bash gisnet-secure-ssh.sh --dry-run   # lihat dulu apa yang akan dilakukan (tidak mengubah apa pun)
 sudo bash gisnet-secure-ssh.sh             # pasang
 ```
@@ -166,7 +166,7 @@ URL dan token didapat dari aplikasi pemantau. Token disimpan di `/etc/gisnet-sec
 
 ```bash
 # 1. Pasang skrip (lihat dulu rencananya dengan --dry-run)
-curl -fsSL https://raw.githubusercontent.com/hadynett/fail2ban/main/gisnet-secure-ssh.sh -o gisnet-secure-ssh.sh
+curl -fsSL https://raw.githubusercontent.com/hadynett/gis-secured/main/gisnet-secure-ssh.sh -o gisnet-secure-ssh.sh
 sudo bash gisnet-secure-ssh.sh --dry-run
 sudo bash gisnet-secure-ssh.sh
 
@@ -184,7 +184,7 @@ Pasang ulang dengan skrip terbaru. Kunci dan whitelist yang sudah ada tetap dipa
 
 ```bash
 rm -f gisnet-secure-ssh.sh
-curl -fsSL https://raw.githubusercontent.com/hadynett/fail2ban/main/gisnet-secure-ssh.sh -o gisnet-secure-ssh.sh
+curl -fsSL https://raw.githubusercontent.com/hadynett/gis-secured/main/gisnet-secure-ssh.sh -o gisnet-secure-ssh.sh
 bash gisnet-secure-ssh.sh --version        # pastikan versi terbaru (GitHub kadang telat ±5 menit)
 sudo bash gisnet-secure-ssh.sh
 gisnet-secure-ssh report allow-reboot on   # bila ingin reboot dari aplikasi (v2.3+), bila belum diizinkan

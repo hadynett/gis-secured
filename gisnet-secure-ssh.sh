@@ -56,7 +56,7 @@ INSTALL_CONF="$STATE_DIR/install.conf"     # opsi pemasangan, dipakai ulang oleh
 WEB_PROXY_STATE="$STATE_DIR/web-proxy"     # cloudflare | proxy -- jail web dilewati
 SHARED_OFF="$STATE_DIR/shared-blocklist-off"
 ALLOW_UPDATE="$STATE_DIR/allow-update"
-UPDATE_URL_DEFAULT='https://raw.githubusercontent.com/hadynett/fail2ban/main/gisnet-secure-ssh.sh'
+UPDATE_URL_DEFAULT='https://raw.githubusercontent.com/hadynett/gis-secured/main/gisnet-secure-ssh.sh'
 JAIL=/etc/fail2ban/jail.d/gisnet.local
 F2B_LOG=/var/log/fail2ban.log
 SSHD_CONFIG=/etc/ssh/sshd_config
@@ -1160,7 +1160,7 @@ allow_reboot_choose() { # allow_reboot_choose yes|no|ask -- ask: tanya bila ada 
 allow_update_set() { # allow_update_set on|off
     if [ "$1" = on ]; then
         mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR"; touch "$ALLOW_UPDATE"; chmod 600 "$ALLOW_UPDATE"
-        c_ok "Update skrip dari aplikasi DIIZINKAN (diunduh dari GitHub hadynett/fail2ban, pengaturan tetap)."
+        c_ok "Update skrip dari aplikasi DIIZINKAN (diunduh dari GitHub hadynett/gis-secured, pengaturan tetap)."
     else
         rm -f "$ALLOW_UPDATE"; c_ok "Update skrip dari aplikasi tidak diizinkan."
     fi
@@ -1251,7 +1251,7 @@ cmd_update() { # update [--check] [--force] [--quiet] -- unduh versi terbaru lal
     # Repo private: GH_TOKEN=<token read-only> gisnet-secure-ssh update
     if [ -n "${GH_TOKEN-}" ]; then
         curl -fsSL --max-time 60 -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/vnd.github.raw' \
-            https://api.github.com/repos/hadynett/fail2ban/contents/gisnet-secure-ssh.sh -o "$tmp" || { rm -f "$tmp"; die "Gagal mengunduh (periksa GH_TOKEN)."; }
+            https://api.github.com/repos/hadynett/gis-secured/contents/gisnet-secure-ssh.sh -o "$tmp" || { rm -f "$tmp"; die "Gagal mengunduh (periksa GH_TOKEN)."; }
     else
         curl -fsSL --max-time 60 "$url" -o "$tmp" || { rm -f "$tmp"; die "Gagal mengunduh $url (repo private? pakai GH_TOKEN=...)."; }
     fi
