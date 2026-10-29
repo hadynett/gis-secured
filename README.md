@@ -1,14 +1,18 @@
-# gisnet-secure-ssh
+# gis-secured (gisnet-secure-ssh)
 
-Satu skrip untuk mengamankan SSH server Linux, lalu mengelolanya sehari-hari:
+Satu skrip untuk mengamankan server Linux, lalu mengelolanya sehari-hari. Perintahnya tetap `gisnet-secure-ssh`.
 
 - memasang **kunci publik SSH** Anda ke root (ditanyakan saat dijalankan);
 - memasang & menyalakan **fail2ban** (jail `sshd` mode *aggressive* + *recidive*);
 - **whitelist** IP/subnet yang tidak pernah diblokir;
 - **mengetatkan SSH**: login hanya dengan kunci, password dimatikan, root hanya boleh dengan kunci;
 - **update keamanan otomatis** (unattended-upgrades / dnf-automatic / yum-cron);
-- **jail pemindai website** bila ada nginx/apache (blokir hanya port web, 6 jam);
-- perintah harian: `status`, `banned`, `ban`/`unban`, `whitelist`, `key`, `port`, `restore`, `report`, `menu`.
+- **jail pemindai website** bila ada nginx/apache (blokir hanya port web, 6 jam), otomatis dilewati bila website di belakang Cloudflare/proxy;
+- **jail FTP & email** (vsftpd, proftpd, pure-ftpd, postfix, dovecot) bila layanannya ada;
+- **pemeriksaan server**: kesehatan (CPU/RAM/disk), port berbahaya yang terbuka, proses mencurigakan (penambang kripto, program dari /tmp), riwayat login SSH;
+- **blokir bersama**: IP penyerang SSH yang diblokir di server GISNET lain ikut diblokir (lewat aplikasi pemantau);
+- **update sendiri**: `gisnet-secure-ssh update` memperbarui skrip & memasang ulang dengan pengaturan yang sama;
+- perintah harian: `status`, `banned`, `ban`/`unban`, `whitelist`, `key`, `port`, `restore`, `report`, `checks`, `update`, `menu`.
 
 Mendukung **Debian, Ubuntu, AlmaLinux / Rocky / RHEL / CentOS / Fedora, openSUSE, Arch, Alpine**.
 
@@ -50,17 +54,19 @@ sudo bash gisnet-secure-ssh.sh \
 | `--no-web-jail` | jangan pasang jail pemindai website |
 | `--report-url <url> --report-token <token>` | kirim status ke aplikasi pemantau tiap 5 menit |
 | `--allow-reboot` / `--no-allow-reboot` | izinkan / tolak reboot dari aplikasi (tanpa opsi ini: ditanyakan) |
+| `--no-service-jails` | jangan pasang jail FTP/email yang terdeteksi |
+| `--no-shared-blocklist` | jangan terima blokir bersama dari aplikasi |
 | `--dry-run` | tampilkan rencana & isi file konfigurasi, tanpa mengubah apa pun |
 | `-h`, `--help` | bantuan |
 
-Menjalankan pemasangan ulang aman: whitelist lama dipertahankan, kunci yang sudah ada tidak digandakan.
+Menjalankan pemasangan ulang aman: whitelist lama dipertahankan, kunci yang sudah ada tidak digandakan, dan opsi pemasangan sebelumnya (mis. `--keep-password`, `--no-web-jail`) diingat.
 
 ## Perintah harian
 
 | Perintah | Arti |
 |---|---|
 | `gisnet-secure-ssh menu` | menu interaktif semua fitur |
-| `gisnet-secure-ssh status` | ringkasan: fail2ban, jumlah blokir per jail, whitelist, pengaturan SSH, update otomatis, 10 blokir terakhir |
+| `gisnet-secure-ssh status` | ringkasan: fail2ban, jumlah blokir per jail, whitelist, pengaturan SSH, update otomatis, kesehatan, port berbahaya, proses mencurigakan, login SSH terakhir, 10 blokir terakhir |
 | `gisnet-secure-ssh banned` | daftar IP yang sedang diblokir |
 | `gisnet-secure-ssh ban <ip>` | blokir IP secara manual (port SSH). IP yang ada di whitelist ditolak |
 | `gisnet-secure-ssh unban <ip>` | buka blokir satu IP; `unban all` = buka semua |
@@ -69,6 +75,38 @@ Menjalankan pemasangan ulang aman: whitelist lama dipertahankan, kunci yang suda
 | `gisnet-secure-ssh port <N>` | ganti port SSH dengan aman (lihat bagian di bawah) |
 | `gisnet-secure-ssh restore` | kembalikan pengaturan dari cadangan terakhir |
 | `gisnet-secure-ssh report` | kirim status ke aplikasi pemantau |
+| `gisnet-secure-ssh checks` | hasil pemeriksaan server (JSON) |
+| `gisnet-secure-ssh update` | perbarui skrip ke versi terbaru & pasang ulang dengan pengaturan sama (`--check` = cek saja) |
+
+### Memperbarui skrip (mulai v2.5)
+
+```bash
+gisnet-secure-ssh update --check   # lihat versi terpasang & terbaru
+gisnet-secure-ssh update           # unduh, ganti, pasang ulang (kunci, whitelist, port, laporan & izin tetap)
+```
+
+- File yang diunduh dicek dulu (harus skrip yang valid). Versi lama disimpan di `/etc/gisnet-secure-ssh/gisnet-secure-ssh.prev`.
+- Repo private: `GH_TOKEN=<token read-only> gisnet-secure-ssh update`.
+- Versi sebelum 2.5 belum punya perintah ini: unduh ulang skrip sekali, pasang ulang (Enter di semua pertanyaan), setelah itu cukup `update`.
+- Bisa juga dari aplikasi (tombol **Perbarui skrip**), bila server mengizinkan: `gisnet-secure-ssh report allow-update on`.
+
+### Pemeriksaan server (mulai v2.5)
+
+Ikut di `status` dan di laporan ke aplikasi:
+
+- **Kesehatan**: load CPU, RAM, swap, disk.
+- **Port berbahaya terbuka**: layanan yang mendengarkan di alamat publik, mis. MySQL/MariaDB 3306, Redis 6379, GenieACS NBI 7557, MongoDB, Docker API, Webmin. Bila memang perlu terbuka (mis. hanya untuk server tertentu lewat firewall), tandai aman di aplikasi.
+- **Proses mencurigakan**: nama penambang kripto yang dikenal (xmrig, kdevtmpfsi, kinsing, ...), program yang berjalan dari `/tmp`, `/var/tmp`, `/dev/shm`, dan proses yang memakai CPU ≥90% selama 30 menit lebih.
+- **Login SSH** 7 hari terakhir: kapan, user, dari IP mana, metode, dan nama kunci bila cocok.
+
+### Blokir bersama (mulai v2.5)
+
+IP yang menyerang SSH di salah satu server GISNET ikut diblokir di server lain (jail `gisnet-shared`, port SSH saja, 24 jam). Daftarnya datang dari aplikasi pemantau di balasan laporan; IP whitelist semua server dan IP privat tidak pernah ikut.
+
+```bash
+gisnet-secure-ssh report shared-blocklist off   # matikan
+gisnet-secure-ssh report shared-blocklist on    # nyalakan lagi
+```
 
 ### Whitelist
 
@@ -136,7 +174,7 @@ sudo bash gisnet-secure-ssh.sh
 gisnet-secure-ssh report setup <url-laporan> <token>
 ```
 
-Di langkah 2 skrip bertanya **"Izinkan reboot dari aplikasi? [y/N]"**. Jawab `y` supaya tombol **Reboot** di kartu server langsung aktif, atau Enter untuk menolak. Kartu server muncul di aplikasi begitu langkah 2 selesai.
+Di langkah 2 skrip bertanya **"Izinkan reboot dari aplikasi? [y/N]"** dan **"Izinkan update skrip dari aplikasi? [y/N]"**. Jawab `y` supaya tombol **Reboot** di kartu server langsung aktif, atau Enter untuk menolak. Kartu server muncul di aplikasi begitu langkah 2 selesai.
 
 Tanpa pertanyaan: tambahkan `--allow-reboot` (izinkan) atau `--no-allow-reboot` (tolak), mis. `gisnet-secure-ssh report setup <url> <token> --allow-reboot`. Izin bisa diubah kapan saja dengan `report allow-reboot on|off`.
 

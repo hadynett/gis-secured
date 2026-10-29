@@ -19,6 +19,8 @@
 #     --no-web-jail          jangan pasang jail pemindai web (nginx/apache)
 #     --report-url <url> --report-token <token>   kirim status ke aplikasi pemantau
 #     --allow-reboot / --no-allow-reboot   izinkan / tolak reboot dari aplikasi (tanpa: ditanya)
+#     --no-service-jails     jangan pasang jail FTP/email yang terdeteksi
+#     --no-shared-blocklist  jangan terima blokir bersama dari aplikasi
 #     --dry-run              tampilkan rencana saja
 #
 #  PERINTAH (setelah terpasang, tersedia juga sebagai: gisnet-secure-ssh <perintah>):
@@ -32,6 +34,10 @@
 #     restore [folder-cadangan]             kembalikan pengaturan dari cadangan
 #     report [now|setup <url> <token> [--allow-reboot]|off]   laporan status ke aplikasi
 #     report allow-reboot on|off             izinkan reboot (sekarang / 00.00 / batal) dari aplikasi
+#     report allow-update on|off             izinkan update skrip dari aplikasi
+#     report shared-blocklist on|off         blokir bersama: IP penyerang dari server GISNET lain
+#     update [--check] [--force]             perbarui skrip ke versi terbaru, pengaturan tetap
+#     checks                                 pemeriksaan: kesehatan, port terbuka, proses, login SSH (JSON)
 #
 #  PENGAMAN: password SSH baru dimatikan setelah kunci terverifikasi; semua file
 #  dicadangkan (/root/gisnet-secure-ssh-backup-<waktu>/); konfigurasi diuji
@@ -41,11 +47,16 @@
 # =============================================================================
 set -euo pipefail
 
-SCRIPT_VERSION='2.4'
+SCRIPT_VERSION='2.5'
 SELF_INSTALL=/usr/local/sbin/gisnet-secure-ssh
 STATE_DIR=/etc/gisnet-secure-ssh
 REPORT_CONF="$STATE_DIR/report.conf"
 ALLOW_REBOOT="$STATE_DIR/allow-reboot"
+INSTALL_CONF="$STATE_DIR/install.conf"     # opsi pemasangan, dipakai ulang oleh "update"
+WEB_PROXY_STATE="$STATE_DIR/web-proxy"     # cloudflare | proxy -- jail web dilewati
+SHARED_OFF="$STATE_DIR/shared-blocklist-off"
+ALLOW_UPDATE="$STATE_DIR/allow-update"
+UPDATE_URL_DEFAULT='https://raw.githubusercontent.com/hadynett/fail2ban/main/gisnet-secure-ssh.sh'
 JAIL=/etc/fail2ban/jail.d/gisnet.local
 F2B_LOG=/var/log/fail2ban.log
 SSHD_CONFIG=/etc/ssh/sshd_config
@@ -79,7 +90,7 @@ key_blob() { printf '%s' "$1" | awk '{print $2}'; }
 # Pertanyaan dibaca dari terminal (/dev/tty) supaya tetap bisa dijawab walau
 # skrip dijalankan lewat "curl ... | bash".
 TTY=''
-if [ -r /dev/tty ] && { : < /dev/tty; } 2>/dev/null; then TTY=/dev/tty; fi
+if [ -z "${GISNET_NONINTERACTIVE-}" ] && [ -r /dev/tty ] && { : < /dev/tty; } 2>/dev/null; then TTY=/dev/tty; fi
 ask() { local reply=''; printf '%s' "$1" > /dev/tty; IFS= read -r reply < /dev/tty || true; printf '%s' "$reply"; }
 confirm() { [ -n "$TTY" ] || return 0; case "$(lower "$(ask "$1 [y/N]: ")")" in y|ya|yes) return 0 ;; *) return 1 ;; esac; }
 need_root() { [ "$(id -u)" -eq 0 ] || die "Jalankan sebagai root (sudo)."; }
@@ -169,8 +180,17 @@ failregex = ^<HOST> \S+ \S+ \[[^\]]*\] "(?:GET|POST|HEAD|PUT) [^"]*(?:\.env|wp-l
 ignoreregex =
 EOF
 }
-gen_jail() { # gen_jail <whitelist> <banaction> <ports> <sshd-log> [weblog]
-    local wl="$1" ba="$2" ports="$3" sshdlog="$4" weblog="${5-}"
+gen_shared_filter() {
+    cat <<'EOF'
+# Blokir bersama antar-server (gisnet-secure-ssh.sh): diisi dari aplikasi lewat "fail2ban-client set gisnet-shared banip",
+# tidak pernah dari log -- regex ini sengaja tidak pernah cocok.
+[Definition]
+failregex = ^GISNET-SHARED-NEVER-MATCHES <HOST>$
+ignoreregex =
+EOF
+}
+gen_jail() { # gen_jail <whitelist> <banaction> <ports> <sshd-log> [weblog] [shared 0|1] [blok-jail-layanan]
+    local wl="$1" ba="$2" ports="$3" sshdlog="$4" weblog="${5-}" shared="${6:-0}" extra="${7-}"
     cat <<EOF
 # fail2ban -- dipasang gisnet-secure-ssh.sh v$SCRIPT_VERSION ($(date '+%Y-%m-%d %H:%M'))
 # Semua blokir HANYA port yang diserang (bukan semua port) -- aman untuk IP NAT bersama.
@@ -211,6 +231,81 @@ maxretry = 5
 bantime  = 6h
 EOF
     fi
+    if [ "$shared" = 1 ]; then
+        cat <<EOF
+
+# Blokir bersama: IP penyerang SSH yang diblokir di server GISNET lain (dari aplikasi), port SSH saja.
+[gisnet-shared]
+enabled   = true
+filter    = gisnet-shared
+logpath   = $F2B_LOG
+banaction = $ba
+port      = $ports
+maxretry  = 1
+bantime   = 24h
+EOF
+    fi
+    [ -n "$extra" ] && printf '\n%s\n' "$extra"
+    return 0
+}
+# Jail bawaan fail2ban untuk layanan lain yang ditemukan di server (FTP, email).
+service_jail_candidates() { # cetak "nama|blok" per baris kosong
+    local backend='backend = systemd' maillog=''
+    [ "${HAS_SYSTEMD:-0}" -eq 1 ] || backend='backend = auto'
+    [ -f /var/log/mail.log ] && maillog=1
+    svc_present() { [ -d "/etc/$1" ] || have "$1"; }
+    if svc_present postfix; then
+        printf '%s\n\n' "postfix-sasl|# Tebak password SMTP (postfix)
+[postfix-sasl]
+enabled = true
+$([ -n "$maillog" ] && echo 'backend = auto' || echo "$backend")"
+    fi
+    if svc_present dovecot; then
+        printf '%s\n\n' "dovecot|# Tebak password IMAP/POP3 (dovecot)
+[dovecot]
+enabled = true
+$([ -n "$maillog" ] && echo 'backend = auto' || echo "$backend")"
+    fi
+    local ftp
+    for ftp in vsftpd proftpd pure-ftpd; do
+        if svc_present "$ftp" || [ -f "/etc/$ftp.conf" ]; then
+            printf '%s\n\n' "$ftp|# Tebak password FTP ($ftp)
+[$ftp]
+enabled = true
+$backend"
+        fi
+    done
+    return 0
+}
+# Deteksi website di belakang Cloudflare / reverse proxy: log hanya berisi IP proxy, jadi jail web
+# akan memblokir pengunjung asli. Hasil: cloudflare | proxy | (kosong = aman).
+detect_web_proxy() { # detect_web_proxy <access-log>
+    [ -f "$1" ] || return 0
+    tail -n 2000 "$1" 2>/dev/null | awk '
+        function ip2n(ip,  p) { split(ip, p, "."); return ((p[1]*256 + p[2])*256 + p[3])*256 + p[4] }
+        function inr(n, cidr,  a, b, m) { split(cidr, a, "/"); b = ip2n(a[1]); m = 2^(32 - a[2]); return n >= b && n < b + m }
+        BEGIN { n = split("173.245.48.0/20 103.21.244.0/22 103.22.200.0/22 103.31.4.0/22 141.101.64.0/18 108.162.192.0/18 190.93.240.0/20 188.114.96.0/20 197.234.240.0/22 198.41.128.0/17 162.158.0.0/15 104.16.0.0/13 104.24.0.0/14 172.64.0.0/13 131.0.72.0/22", cf, " ") }
+        {
+            ip = $1; total++
+            if (ip ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) {
+                v = ip2n(ip)
+                if (ip ~ /^(10\.|127\.|192\.168\.)/ || (v >= ip2n("172.16.0.0") && v < ip2n("172.32.0.0"))) { priv++; next }
+                for (i = 1; i <= n; i++) if (inr(v, cf[i])) { cfc++; next }
+            } else if (tolower(ip) ~ /^(2400:cb00|2606:4700|2803:f800|2405:b500|2405:8100|2a06:98c[0-7]|2c0f:f248):/) { cfc++ }
+            else if (ip == "::1") { priv++ }
+        }
+        END { if (total < 20) exit; if (cfc * 2 >= total) print "cloudflare"; else if (priv * 2 >= total) print "proxy" }'
+}
+# Opsi pemasangan disimpan supaya "update" memasang ulang dengan pilihan yang sama.
+save_install_conf() {
+    mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR"
+    {
+        printf 'SAVED_KEEP_PASSWORD=%q\n' "$KEEP_PASSWORD"
+        printf 'SAVED_AUTO_UPDATE=%q\n' "$AUTO_UPDATE"
+        printf 'SAVED_WEB_JAIL=%q\n' "$WEB_JAIL"
+        printf 'SAVED_SERVICE_JAILS=%q\n' "$SERVICE_JAILS"
+        printf 'SAVED_EXTRA_USERS=%q\n' "${EXTRA_USERS[*]-}"
+    } > "$INSTALL_CONF"; chmod 600 "$INSTALL_CONF"
 }
 gen_ssh_settings() { # gen_ssh_settings <yes|no> -- hanya opsi yang dikenali OpenSSH ini
     local pw="$1" supported kw val
@@ -246,13 +341,28 @@ wl_current() { [ -f "$JAIL" ] && awk '/^[[:space:]]*ignoreip[[:space:]]*=/{sub(/
 
 # ================================================================ INSTALL ===
 cmd_install() {
-    local KEYS=() WL_INPUT='' WL_GIVEN=0 EXTRA_USERS=() KEEP_PASSWORD=0 NEW_PORT='' AUTO_UPDATE=1 WEB_JAIL=1 DRY=0 R_URL='' R_TOKEN='' R_REBOOT=ask
+    local KEYS=() WL_INPUT='' WL_GIVEN=0 EXTRA_USERS=() KEEP_PASSWORD=0 NEW_PORT='' AUTO_UPDATE=1 WEB_JAIL=1 SERVICE_JAILS=1 DRY=0 R_URL='' R_TOKEN='' R_REBOOT=ask SHARED=''
+    # Pemasangan ulang / update: mulai dari pilihan yang tersimpan, opsi di baris perintah tetap menang.
+    if [ -f "$INSTALL_CONF" ]; then
+        local SAVED_KEEP_PASSWORD=0 SAVED_AUTO_UPDATE=1 SAVED_WEB_JAIL=1 SAVED_SERVICE_JAILS=1 SAVED_EXTRA_USERS=''
+        # shellcheck disable=SC1090
+        . "$INSTALL_CONF"
+        KEEP_PASSWORD="$SAVED_KEEP_PASSWORD"; AUTO_UPDATE="$SAVED_AUTO_UPDATE"; WEB_JAIL="$SAVED_WEB_JAIL"; SERVICE_JAILS="$SAVED_SERVICE_JAILS"
+        local su; for su in $SAVED_EXTRA_USERS; do EXTRA_USERS+=("$su"); done
+    fi
     while [ $# -gt 0 ]; do
         case "$1" in
             --key) KEYS+=("${2:?--key butuh nilai}"); shift 2 ;;
             --whitelist) WL_INPUT="${2-}"; WL_GIVEN=1; shift 2 ;;
             --user) EXTRA_USERS+=("${2:?--user butuh nilai}"); shift 2 ;;
             --keep-password) KEEP_PASSWORD=1; shift ;;
+            --no-keep-password) KEEP_PASSWORD=0; shift ;;
+            --auto-update) AUTO_UPDATE=1; shift ;;
+            --web-jail) WEB_JAIL=1; shift ;;
+            --no-service-jails) SERVICE_JAILS=0; shift ;;
+            --service-jails) SERVICE_JAILS=1; shift ;;
+            --shared-blocklist) SHARED=1; shift ;;
+            --no-shared-blocklist) SHARED=0; shift ;;
             --ssh-port) NEW_PORT="${2:?--ssh-port butuh nilai}"; shift 2 ;;
             --no-auto-update) AUTO_UPDATE=0; shift ;;
             --no-web-jail) WEB_JAIL=0; shift ;;
@@ -325,6 +435,21 @@ cmd_install() {
     BANACTION="$(detect_banaction)"; SSHDLOG="$(detect_sshd_log)"
     [ "$WEB_JAIL" -eq 1 ] && WEBLOG="$(detect_weblog || true)"
     [ "$KEEP_PASSWORD" -eq 1 ] && PW=yes
+    local WEB_PROXY=''
+    if [ -n "$WEBLOG" ]; then
+        WEB_PROXY="$(detect_web_proxy "$WEBLOG" || true)"
+        if [ -n "$WEB_PROXY" ]; then
+            c_warn "Website di belakang $([ "$WEB_PROXY" = cloudflare ] && echo Cloudflare || echo 'reverse proxy'): log hanya berisi IP proxy -- jail web DILEWATI supaya pengunjung asli tidak ikut terblokir."
+            c_warn "Atur nginx/apache agar mencatat IP asli pengunjung (real_ip / mod_remoteip), lalu jalankan pemasangan lagi."
+            WEBLOG=''
+        fi
+    fi
+    [ -z "$SHARED" ] && { [ -f "$SHARED_OFF" ] && SHARED=0 || SHARED=1; }
+    local SVC_JAILS='' SVC_NAMES=''
+    if [ "$SERVICE_JAILS" -eq 1 ]; then
+        SVC_JAILS="$(service_jail_candidates)"
+        SVC_NAMES="$(printf '%s\n' "$SVC_JAILS" | awk -F'|' '/^[a-z-]+\|/{print $1}' | paste -sd' ' -)"
+    fi
 
     if [ "$DRY" -eq 1 ]; then
         echo; c_info "MODE UJI (--dry-run): tidak ada yang diubah."
@@ -333,11 +458,13 @@ cmd_install() {
         c_plan "Port SSH: $PORTS$([ -n "$NEW_PORT" ] && echo " (port baru $NEW_PORT, port lama tetap dibuka)")"
         c_plan "Login password SSH: $([ "$PW" = no ] && echo 'DIMATIKAN (kunci saja)' || echo 'tetap aktif')"
         c_plan "Update keamanan otomatis: $([ "$AUTO_UPDATE" -eq 1 ] && echo ya || echo tidak)"
-        c_plan "Jail web: ${WEBLOG:-tidak (nginx/apache tidak ditemukan atau --no-web-jail)}"
+        c_plan "Jail web: ${WEBLOG:-tidak ($([ -n "$WEB_PROXY" ] && echo "website di belakang $WEB_PROXY" || echo 'nginx/apache tidak ditemukan atau --no-web-jail'))}"
+        c_plan "Jail layanan lain: ${SVC_NAMES:-tidak ada (FTP/email tidak ditemukan)}"
+        c_plan "Blokir bersama antar-server: $([ "$SHARED" = 1 ] && echo 'ya (IP dari aplikasi, port SSH)' || echo tidak)"
         c_plan "Laporan ke aplikasi: ${R_URL:-tidak}"
         c_plan "Reboot dari aplikasi: $(case $R_REBOOT in yes) echo diizinkan ;; no) echo 'tidak diizinkan' ;; *) [ -n "$R_URL" ] && echo 'ditanyakan saat laporan diaktifkan' || echo 'ditanyakan saat report setup' ;; esac)"
         c_plan "Perintah tersedia setelah ini: $SELF_INSTALL"
-        echo; echo "----- $JAIL -----"; gen_jail "$WHITELIST" "$BANACTION" "$PORTS" "$SSHDLOG" "$WEBLOG"
+        echo; echo "----- $JAIL -----"; gen_jail "$WHITELIST" "$BANACTION" "$PORTS" "$SSHDLOG" "$WEBLOG" "$SHARED" "$(printf '%s\n' "$SVC_JAILS" | sed 's/^[a-z-]*|//')"
         echo; echo "----- $DROPIN (atau awal $SSHD_CONFIG) -----"
         printf 'Port %s\n' $(printf '%s' "$PORTS" | tr ',' ' ')
         gen_ssh_settings "$PW"
@@ -376,8 +503,24 @@ cmd_install() {
     printf '[Definition]\nlogtarget = %s\n' "$F2B_LOG" > /etc/fail2ban/fail2ban.d/gisnet.local   # recidive membaca file ini
     backup /etc/fail2ban/filter.d/gisnet-recidive-ssh.conf; gen_recidive_filter > /etc/fail2ban/filter.d/gisnet-recidive-ssh.conf
     if [ -n "$WEBLOG" ]; then backup /etc/fail2ban/filter.d/gisnet-scan.conf; gen_scan_filter > /etc/fail2ban/filter.d/gisnet-scan.conf; fi
-    backup "$JAIL"; gen_jail "$WHITELIST" "$BANACTION" "$PORTS" "$SSHDLOG" "$WEBLOG" > "$JAIL"
+    backup /etc/fail2ban/filter.d/gisnet-shared.conf; gen_shared_filter > /etc/fail2ban/filter.d/gisnet-shared.conf
+    backup "$JAIL"
     touch "$F2B_LOG" 2>/dev/null || true
+    # Jail layanan (FTP/email) dipasang satu per satu: yang membuat konfigurasi gagal diuji dilewati.
+    local OK_SVC='' blk name
+    while IFS= read -r -d $'\x1e' blk; do
+        [ -n "$blk" ] || continue
+        name="${blk%%|*}"; blk="${blk#*|}"
+        gen_jail "$WHITELIST" "$BANACTION" "$PORTS" "$SSHDLOG" "$WEBLOG" "$SHARED" "$OK_SVC
+$blk" > "$JAIL"
+        if fail2ban-client -t >/dev/null 2>&1; then OK_SVC="$OK_SVC
+$blk"; c_ok "Jail layanan $name dipasang."
+        else c_warn "Jail layanan $name dilewati (log layanannya tidak terbaca fail2ban)."; fi
+    done < <(printf '%s' "$SVC_JAILS" | awk 'BEGIN{RS=""; ORS="\x1e"} {print}')
+    gen_jail "$WHITELIST" "$BANACTION" "$PORTS" "$SSHDLOG" "$WEBLOG" "$SHARED" "$OK_SVC" > "$JAIL"
+    mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR"
+    if [ -n "$WEB_PROXY" ]; then echo "$WEB_PROXY" > "$WEB_PROXY_STATE"; else rm -f "$WEB_PROXY_STATE"; fi
+    if [ "$SHARED" = 1 ]; then rm -f "$SHARED_OFF"; else touch "$SHARED_OFF"; fi
     if ! { fail2ban-client -t >/dev/null 2>&1 || fail2ban-client -d >/dev/null 2>&1; }; then
         c_err "Konfigurasi fail2ban tidak valid:"; fail2ban-client -d 2>&1 | tail -5 || true
         restore_from "$BACKUP_DIR" quiet; die "Pengaturan dikembalikan."
@@ -398,6 +541,7 @@ cmd_install() {
 
     # --- 5. perintah sistem + laporan
     install_self
+    save_install_conf
     if [ -n "$R_URL" ]; then report_setup "$R_URL" "$R_TOKEN" "$R_REBOOT"
     elif [ "$R_REBOOT" != ask ]; then allow_reboot_choose "$R_REBOOT"; fi   # berlaku saat laporan nanti diaktifkan
 
@@ -533,6 +677,26 @@ cmd_status() {
     echo " Update otomatis: $(auto_update_status)"
     echo " Laporan       : $([ -f "$REPORT_CONF" ] && . "$REPORT_CONF" && echo "aktif ke $REPORT_URL" || echo 'tidak aktif')"
     echo " Reboot via app: $([ -f "$ALLOW_REBOOT" ] && echo diizinkan || echo 'tidak diizinkan')$( s="$(reboot_scheduled_at)"; [ -n "$s" ] && echo " · terjadwal $(date -d "@$s" '+%d/%m %H:%M')" )"
+    echo " Update via app: $([ -f "$ALLOW_UPDATE" ] && echo diizinkan || echo 'tidak diizinkan') · blokir bersama: $([ -f "$SHARED_OFF" ] && echo 'tidak aktif' || echo aktif)"
+    [ -f "$WEB_PROXY_STATE" ] && echo " Jail web      : dilewati -- website di belakang $(cat "$WEB_PROXY_STATE")"
+    # --- pemeriksaan server
+    local mt ma du l1 cpus
+    read -r l1 _ < /proc/loadavg 2>/dev/null || l1='?'; cpus="$(nproc 2>/dev/null || echo '?')"
+    mt="$(awk '/^MemTotal:/{print $2}' /proc/meminfo 2>/dev/null)"; ma="$(awk '/^MemAvailable:/{print $2}' /proc/meminfo 2>/dev/null)"
+    du="$(df -Pk / 2>/dev/null | tail -1 | awk '{print $(NF-1)}')"
+    echo " Kesehatan     : load $l1 / $cpus CPU · RAM $( [ -n "$mt" ] && [ -n "$ma" ] && echo "$(( (mt - ma) * 100 / mt ))%" || echo '?') · disk / ${du:-?}"
+    local risky
+    risky="$(checks_ports | grep -oE '"port":[0-9]+,[^}]*"risk":"[^"]+"' | sed -E 's/"port":([0-9]+),.*"risk":"([^"]+)"/\1 (\2)/' | paste -sd',' - || true)"
+    [ -n "$risky" ] && printf ' \033[33mPort berbahaya terbuka: %s -- pastikan diblokir firewall dari internet.\033[0m\n' "$risky"
+    local susp
+    susp="$(checks_processes | grep -oE '"name":"[^"]*","exe":"[^"]*","reason":"[a-z]+"' | sed -E 's/"name":"([^"]*)","exe":"([^"]*)","reason":"([a-z]+)"/\1 [\3] \2/' || true)"
+    if [ -n "$susp" ]; then
+        printf ' \033[31mProses mencurigakan:\033[0m\n'; printf '%s\n' "$susp" | sed 's/^/   /'
+    fi
+    local logins
+    logins="$(checks_logins)"
+    echo " Login SSH 7 hari: ${logins##*|} kali; terakhir:"
+    printf '%s' "${logins%|*}" | grep -oE '\{[^}]*\}' | tail -5 | sed -E 's/.*"at":"([^"]*)","user":"([^"]*)","ip":"([^"]*)","method":"([^"]*)","key":"?([^"}]*)"?.*/   \1  \2 dari \3 (\4 \5)/; s/ null\)/)/' || true
     if [ -f "$F2B_LOG" ]; then
         echo " Blokir terakhir:"
         grep -E 'NOTICE +\[[^]]+\] Ban ' "$F2B_LOG" 2>/dev/null | tail -10 | awk '{for(i=1;i<=NF;i++) if($i=="Ban"){print "   " $1 " " substr($2,1,8) "  " $(i-1) "  " $(i+1)}}' | sed 's/\[\(.*\)\]/\1/' || true
@@ -773,6 +937,106 @@ cmd_restore() {
     c_ok "Selesai. Pengaturan dikembalikan ke kondisi sebelum $(basename "$dir" | sed 's/gisnet-secure-ssh-backup-//')."
 }
 
+# ============================================================ PEMERIKSAAN ===
+# Port yang berbahaya bila terbuka ke internet (dicek: mendengarkan di semua alamat / alamat publik).
+RISKY_PORTS='21:FTP 23:Telnet 111:rpcbind 139:SMB 445:SMB 873:rsync 2049:NFS 2375:Docker-API 2376:Docker-API 3000:Panel-web(GenieACS/Grafana) 3306:MySQL/MariaDB 3389:RDP 5432:PostgreSQL 5601:Kibana 5672:RabbitMQ 5900:VNC 6379:Redis 7557:GenieACS-NBI 7567:GenieACS-FS 8086:InfluxDB 9090:Prometheus/Cockpit 9200:Elasticsearch 10000:Webmin 11211:Memcached 15672:RabbitMQ-admin 27017:MongoDB'
+MINER_NAMES='xmrig|xmr-stak|xmrstak|kdevtmpfsi|kinsing|minerd|cpuminer|ethminer|nbminer|t-rex|lolminer|phoenixminer|nanominer|teamredminer|gminer|srbminer|kthreaddi|kswapd0x|sysupdate|networkservice'
+
+checks_health() {
+    local cpus l1 l5 l15 mt ma st sf dt du
+    cpus="$(nproc 2>/dev/null || echo 1)"
+    read -r l1 l5 l15 _ < /proc/loadavg 2>/dev/null || { l1=0; l5=0; l15=0; }
+    mt="$(awk '/^MemTotal:/{print $2}' /proc/meminfo 2>/dev/null)"; ma="$(awk '/^MemAvailable:/{print $2}' /proc/meminfo 2>/dev/null)"
+    [ -n "$ma" ] || ma="$(awk '/^MemFree:/{print $2}' /proc/meminfo 2>/dev/null)"
+    st="$(awk '/^SwapTotal:/{print $2}' /proc/meminfo 2>/dev/null)"; sf="$(awk '/^SwapFree:/{print $2}' /proc/meminfo 2>/dev/null)"
+    # kolom "Use%" = kolom kedua dari belakang (nama device bisa berspasi)
+    read -r dt du < <(df -Pk / 2>/dev/null | tail -1 | awk '{u=$(NF-1); gsub(/%/,"",u); print $2, u}') || true
+    pct() { awk -v v="$1" 'BEGIN{v=int(v); if (v<0) v=0; if (v>100) v=100; print v}'; }
+    num() { awk -v v="$1" 'BEGIN{printf "%.2f", (v+0 < 0 ? 0 : v+0)}'; }
+    printf '{"cpus":%s,"load1":%s,"load5":%s,"load15":%s,"mem_total_mb":%s,"mem_used_pct":%s,"swap_used_pct":%s,"disk_total_gb":%s,"disk_used_pct":%s}' \
+        "$(awk -v v="${cpus:-1}" 'BEGIN{print (int(v) > 0 ? int(v) : 1)}')" "$(num "${l1:-0}")" "$(num "${l5:-0}")" "$(num "${l15:-0}")" \
+        "$(( ${mt:-0} / 1024 ))" \
+        "$(pct "$( [ "${mt:-0}" -gt 0 ] && echo $(( (mt - ${ma:-0}) * 100 / mt )) || echo 0 )")" \
+        "$(pct "$( [ "${st:-0}" -gt 0 ] && echo $(( (st - ${sf:-0}) * 100 / st )) || echo 0 )")" \
+        "$(awk -v k="${dt:-0}" 'BEGIN{v=k/1048576; printf "%.1f", (v<0?0:v)}')" "$(pct "${du:-0}")"
+}
+checks_ports() { # JSON array port TCP yang mendengarkan (bukan loopback)
+    have ss || { printf '[]'; return; }
+    ss -H -tlnp 2>/dev/null | awk -v risky="$RISKY_PORTS" '
+        BEGIN { n = split(risky, r, " "); for (i = 1; i <= n; i++) { split(r[i], kv, ":"); lab[kv[1]] = kv[2]; gsub(/-/, " ", lab[kv[1]]) } }
+        {
+            local = $4; port = local; sub(/.*:/, "", port); addr = local; sub(/:[0-9]+$/, "", addr); gsub(/[\[\]]/, "", addr)
+            sub(/%.*/, "", addr)
+            if (addr ~ /^127\./ || addr == "::1") next
+            proc = ""; if (match($0, /\(\("[^"]+"/)) { proc = substr($0, RSTART + 3, RLENGTH - 4) }
+            pub = (addr == "0.0.0.0" || addr == "*" || addr == "::" || (addr !~ /^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|169\.254\.|fe80|fd|fc)/)) ? "true" : "false"
+            key = port "|" pub; if (seen[key]++) next
+            risk = (pub == "true" && (port in lab)) ? "\"" lab[port] "\"" : "null"
+            gsub(/["\\]/, "", proc); gsub(/["\\]/, "", addr)
+            out = out (out ? "," : "") sprintf("{\"port\":%d,\"proto\":\"tcp\",\"addr\":\"%s\",\"process\":\"%s\",\"public\":%s,\"risk\":%s}", port, addr, proc, pub, risk)
+            if (++cnt >= 60) exit
+        }
+        END { printf "[%s]", out }'
+}
+checks_processes() { # JSON array proses mencurigakan
+    local out='' cnt=0 pid user pcpu etimes comm exe reason
+    while read -r pid user pcpu etimes comm; do
+        [ -n "$pid" ] || continue
+        exe="$(readlink "/proc/$pid/exe" 2>/dev/null || true)"
+        reason=''
+        if printf '%s\n%s\n' "$comm" "${exe##*/}" | grep -qiE "^($MINER_NAMES)$"; then reason=miner
+        elif [[ "$exe" =~ ^/(tmp|var/tmp|dev/shm)/ ]]; then reason=tmp
+        elif awk -v c="$pcpu" -v e="$etimes" 'BEGIN{exit !(c >= 90 && e >= 1800)}'; then reason=cpu
+        fi
+        [ -n "$reason" ] || continue
+        out="$out${out:+,}{\"pid\":$pid,\"user\":$(json_str "$user"),\"cpu\":${pcpu:-0},\"name\":$(json_str "$comm"),\"exe\":$(json_str "${exe% (deleted)}"),\"reason\":\"$reason\"}"
+        cnt=$((cnt + 1)); [ "$cnt" -ge 20 ] && break
+    done < <(ps -eo pid=,user=,pcpu=,etimes=,comm= 2>/dev/null)
+    printf '[%s]' "$out"
+}
+checks_logins() { # cetak: <JSON array 10 login terakhir>|<jumlah 7 hari>
+    local raw fpmap
+    if have journalctl && [ "${HAS_SYSTEMD:-0}" -eq 1 ]; then
+        raw="$(journalctl -q --no-pager -o short-iso -u ssh -u sshd --since '-7d' 2>/dev/null | grep 'Accepted ' || true)"
+    else
+        raw="$(cat /var/log/auth.log /var/log/secure 2>/dev/null | grep 'Accepted ' || true)"
+    fi
+    # sidik jari kunci -> nama kunci, dari authorized_keys root
+    fpmap="$(f="$(awk -F: '$1=="root"{print $6}' /etc/passwd)/.ssh/authorized_keys"; [ -f "$f" ] && while IFS= read -r line; do
+        case "$line" in ''|\#*) continue ;; esac
+        fp="$(printf '%s\n' "$line" | ssh-keygen -lf - 2>/dev/null | awk '{print $2}' || true)"; [ -n "$fp" ] && echo "$fp ${line##* }"
+    done < "$f")"
+    printf '%s\n' "$raw" | awk -v fpmap="$fpmap" '
+        BEGIN { n = split(fpmap, l, "\n"); for (i = 1; i <= n; i++) { split(l[i], kv, " "); if (kv[1] != "") name[kv[1]] = kv[2] } }
+        /Accepted / {
+            total++
+            at = $1; if (at ~ /T/) { sub(/T/, " ", at); at = substr(at, 1, 19) } else { at = $1 " " $2 " " $3 }
+            for (i = 1; i <= NF; i++) {
+                if ($i == "Accepted") method = $(i + 1)
+                if ($i == "for") user = $(i + 1)
+                if ($i == "from") ip = $(i + 1)
+                if ($i ~ /^SHA256:/) fp = $i
+            }
+            key = (fp in name) ? "\"" name[fp] "\"" : "null"; fp = ""
+            gsub(/["\\]/, "", user)
+            rows[total] = sprintf("{\"at\":\"%s\",\"user\":\"%s\",\"ip\":\"%s\",\"method\":\"%s\",\"key\":%s}", at, user, ip, method, key)
+        }
+        END { s = (total > 10) ? total - 9 : 1; for (i = s; i <= total; i++) out = out (out ? "," : "") rows[i]; printf "[%s]|%d", out, total }'
+}
+checks_fields() { # potongan JSON (tanpa kurung kurawal) -- dipakai laporan & perintah "checks"
+    local logins web jails
+    logins="$(checks_logins)"
+    web="$(cat "$WEB_PROXY_STATE" 2>/dev/null || true)"
+    jails="$( { fail2ban-client status 2>/dev/null | sed -n 's/.*Jail list:[[:space:]]*//p' | tr -d ' ' | tr ',' '\n' | grep -vxE 'sshd|recidive|gisnet-scan|gisnet-shared|' || true; } | awk '{printf "%s\"%s\"", (NR>1?",":""), $0}')"
+    printf '"health":%s,"open_ports":%s,"suspicious":%s,"logins":%s,"logins_7d":%s,"web_proxy":%s,"service_jails":[%s]' \
+        "$(checks_health)" "$(checks_ports)" "$(checks_processes)" "${logins%|*}" "${logins##*|}" \
+        "$([ -n "$web" ] && json_str "$web" || echo null)" "$jails"
+}
+cmd_checks() { # cetak hasil pemeriksaan sebagai JSON (dipakai skrip status VM aplikasi)
+    detect_os
+    printf '{%s}\n' "$(checks_fields)"
+}
+
 # ======================================================== LAPORAN APLIKASI ===
 json_str() { printf '"%s"' "$(printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr -d '\000-\037')"; }
 report_json() {
@@ -798,15 +1062,20 @@ report_json() {
     root="$("$SSHD_BIN" -T 2>/dev/null | awk '$1=="permitrootlogin"{print $2}')"
     ports="$(ssh_ports)"
     ip="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
-    local allow=false reboot_req=false sched
+    local allow=false reboot_req=false sched allow_up=false shared=false banned_ips=''
     [ -f "$ALLOW_REBOOT" ] && allow=true
+    [ -f "$ALLOW_UPDATE" ] && allow_up=true
+    [ ! -f "$SHARED_OFF" ] && fail2ban-client status gisnet-shared >/dev/null 2>&1 && shared=true
+    if [ "$running" = true ]; then
+        banned_ips="$(for j in sshd recidive; do fail2ban-client status "$j" 2>/dev/null | sed -n 's/.*Banned IP list:[[:space:]]*//p'; done | tr ' ' '\n' | sed '/^$/d' | sort -u | head -300 | awk '{printf "%s\"%s\"", (NR>1?",":""), $0}')"
+    fi
     [ -f /var/run/reboot-required ] && reboot_req=true
     sched="$(reboot_scheduled_at)"
-    printf '{"version":%s,"hostname":%s,"os":%s,"ip":%s,"uptime_seconds":%s,"fail2ban_running":%s,"jails":[%s],"whitelist":%s,"ssh":{"ports":%s,"password_auth":%s,"root_login":%s},"auto_update":%s,"recent_bans":[%s],"allow_reboot":%s,"reboot_required":%s,"reboot_scheduled_at":%s,"generated_at":%s}\n' \
+    printf '{"version":%s,"hostname":%s,"os":%s,"ip":%s,"uptime_seconds":%s,"fail2ban_running":%s,"jails":[%s],"whitelist":%s,"ssh":{"ports":%s,"password_auth":%s,"root_login":%s},"auto_update":%s,"recent_bans":[%s],"allow_reboot":%s,"reboot_required":%s,"reboot_scheduled_at":%s,"allow_update":%s,"shared_blocklist":%s,"banned_ips":[%s],%s,"generated_at":%s}\n' \
         "$(json_str "$SCRIPT_VERSION")" "$(json_str "$(hostname)")" "$(json_str "$OS_NAME")" "$(json_str "$ip")" \
         "$(awk '{print int($1)}' /proc/uptime 2>/dev/null || echo 0)" "$running" "$jails" \
         "$(json_str "$(wl_current | paste -sd' ' - || true)")" "$(json_str "$ports")" "$(json_str "${pw:-}")" "$(json_str "${root:-}")" \
-        "$(json_str "$(auto_update_status)")" "$recent" "$allow" "$reboot_req" "${sched:-null}" "$(date +%s)"
+        "$(json_str "$(auto_update_status)")" "$recent" "$allow" "$reboot_req" "${sched:-null}" "$allow_up" "$shared" "$banned_ips" "$(checks_fields)" "$(date +%s)"
 }
 reboot_scheduled_at() { # epoch detik jadwal reboot systemd, kosong bila tidak ada
     local usec
@@ -838,6 +1107,33 @@ report_send() {
     code="${out##*$'\n'}"; body="${out%$'\n'*}"; [ "$body" = "$out" ] && body=''
     case "$code" in 2*) [ "${1-}" = quiet ] || c_ok "Laporan terkirim ($code)." ;; *) c_err "Laporan gagal (HTTP $code)."; return 1 ;; esac
     report_apply_reboot "$body"
+    report_apply_shared "$body"
+    report_apply_update "$body"
+}
+report_apply_shared() { # report_apply_shared <balasan-json> -- IP dari server lain, port SSH saja
+    [ -f "$SHARED_OFF" ] && return 0
+    fail2ban-client status gisnet-shared >/dev/null 2>&1 || return 0
+    local list ip n=0 current wl
+    list="$(printf '%s' "$1" | grep -oE '"shared_ban" *: *\[[^]]*\]' | grep -oE '"[0-9A-Fa-f:.]+"' | tr -d '"' | head -300 || true)"
+    [ -n "$list" ] || return 0
+    current=" $(fail2ban-client status gisnet-shared 2>/dev/null | sed -n 's/.*Banned IP list:[[:space:]]*//p') "
+    wl=" $(wl_current | tr '\n' ' ') "
+    for ip in $list; do
+        valid_ip "$ip" || continue
+        case "$current" in *" $ip "*) continue ;; esac
+        case "$wl" in *" $ip "*) continue ;; esac
+        fail2ban-client set gisnet-shared banip "$ip" >/dev/null 2>&1 && n=$((n + 1))
+    done
+    [ "$n" -gt 0 ] && logger -t gisnet-secure-ssh "blokir bersama: $n IP baru dari aplikasi" 2>/dev/null
+    return 0
+}
+report_apply_update() { # report_apply_update <balasan-json> -- hanya bila diizinkan; skrip diunduh dari alamat tetap
+    printf '%s' "$1" | grep -qE '"update" *: *true' || return 0
+    if [ ! -f "$ALLOW_UPDATE" ]; then c_warn "Aplikasi meminta update skrip, tetapi server ini tidak mengizinkan."; return 0; fi
+    logger -t gisnet-secure-ssh "update skrip diminta dari aplikasi" 2>/dev/null || true
+    # Jalan di latar belakang: update memasang ulang & mengirim laporan baru sendiri.
+    ( GISNET_NONINTERACTIVE=1 nohup "$SELF_INSTALL" update --quiet >> /var/log/gisnet-secure-ssh-update.log 2>&1 & ) 2>/dev/null || true
+    c_ok "Update skrip dimulai (log: /var/log/gisnet-secure-ssh-update.log)."
 }
 allow_reboot_set() { # allow_reboot_set on|off -- tanpa mengirim laporan
     if [ "$1" = on ]; then
@@ -861,12 +1157,35 @@ allow_reboot_choose() { # allow_reboot_choose yes|no|ask -- ask: tanya bila ada 
             fi ;;
     esac
 }
-report_setup() { # report_setup <url> <token> [yes|no|ask] -- pilihan izin reboot dari aplikasi
-    local url="$1" token="$2" reboot="${3:-ask}"
+allow_update_set() { # allow_update_set on|off
+    if [ "$1" = on ]; then
+        mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR"; touch "$ALLOW_UPDATE"; chmod 600 "$ALLOW_UPDATE"
+        c_ok "Update skrip dari aplikasi DIIZINKAN (diunduh dari GitHub hadynett/fail2ban, pengaturan tetap)."
+    else
+        rm -f "$ALLOW_UPDATE"; c_ok "Update skrip dari aplikasi tidak diizinkan."
+    fi
+}
+allow_update_choose() { # allow_update_choose yes|no|ask
+    case "$1" in
+        yes) allow_update_set on ;;
+        no)  allow_update_set off ;;
+        *)
+            if [ -f "$ALLOW_UPDATE" ]; then c_info "Update skrip dari aplikasi sudah diizinkan (cabut: report allow-update off)."
+            elif [ -n "$TTY" ]; then
+                echo
+                echo "Aplikasi bisa meminta server ini memperbarui skrip ini ke versi terbaru (pengaturan tetap)."
+                if confirm "Izinkan update skrip dari aplikasi?"; then allow_update_set on
+                else c_info "Update dari aplikasi tidak diizinkan (ubah kapan saja: report allow-update on)."; fi
+            fi ;;
+    esac
+}
+report_setup() { # report_setup <url> <token> [yes|no|ask] [yes|no|ask] -- izin reboot, izin update dari aplikasi
+    local url="$1" token="$2" reboot="${3:-ask}" upd="${4:-ask}"
     case "$url" in https://*|http://*) ;; *) die "URL laporan harus diawali https://" ;; esac
     mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR"
     printf 'REPORT_URL=%q\nREPORT_TOKEN=%q\n' "$url" "$token" > "$REPORT_CONF"; chmod 600 "$REPORT_CONF"
     allow_reboot_choose "$reboot"
+    allow_update_choose "$upd"
     install_self
     if [ -d /etc/cron.d ]; then
         printf 'SHELL=/bin/bash\n*/5 * * * * root %s report now quiet >/dev/null 2>&1\n' "$SELF_INSTALL" > /etc/cron.d/gisnet-secure-ssh
@@ -882,18 +1201,20 @@ cmd_report() {
     case "${1-now}" in
         now|kirim) report_send "${2-}" ;;
         setup|atur)
-            local url='' token='' reboot=ask a
+            local url='' token='' reboot=ask upd=ask a
             shift
             for a in "$@"; do
                 case "$a" in
                     --allow-reboot) reboot=yes ;;
                     --no-allow-reboot) reboot=no ;;
+                    --allow-update) upd=yes ;;
+                    --no-allow-update) upd=no ;;
                     *) if [ -z "$url" ]; then url="$a"; elif [ -z "$token" ]; then token="$a"; fi ;;
                 esac
             done
             [ -n "$url" ] || url="$(ask "URL laporan (dari aplikasi): ")"
             [ -n "$token" ] || token="$(ask "Token laporan: ")"
-            report_setup "$url" "$token" "$reboot" ;;
+            report_setup "$url" "$token" "$reboot" "$upd" ;;
         off|matikan) rm -f "$REPORT_CONF" /etc/cron.d/gisnet-secure-ssh; ( crontab -l 2>/dev/null | grep -v 'gisnet-secure-ssh report' ) | crontab - 2>/dev/null || true; c_ok "Laporan dimatikan." ;;
         json) report_json ;;
         allow-reboot|izin-reboot)
@@ -902,8 +1223,57 @@ cmd_report() {
                 off|tidak) allow_reboot_set off; [ -f "$REPORT_CONF" ] && { report_send quiet || true; } ;;
                 *) echo "Reboot dari aplikasi: $([ -f "$ALLOW_REBOOT" ] && echo diizinkan || echo 'tidak diizinkan') (ubah: report allow-reboot on|off)" ;;
             esac ;;
-        *) die "Perintah report tidak dikenal (now | setup <url> <token> | allow-reboot on|off | off | json)" ;;
+        allow-update|izin-update)
+            case "${2-}" in
+                on|ya) allow_update_set on; [ -f "$REPORT_CONF" ] && { report_send quiet || true; } ;;
+                off|tidak) allow_update_set off; [ -f "$REPORT_CONF" ] && { report_send quiet || true; } ;;
+                *) echo "Update skrip dari aplikasi: $([ -f "$ALLOW_UPDATE" ] && echo diizinkan || echo 'tidak diizinkan') (ubah: report allow-update on|off)" ;;
+            esac ;;
+        shared-blocklist|blokir-bersama)
+            case "${2-}" in
+                on|ya) rm -f "$SHARED_OFF"; c_ok "Blokir bersama aktif -- jalankan pemasangan ulang bila jail gisnet-shared belum ada (gisnet-secure-ssh update --force)." ;;
+                off|tidak) mkdir -p "$STATE_DIR"; touch "$SHARED_OFF"; fail2ban-client unban --all >/dev/null 2>&1 || true; c_ok "Blokir bersama dimatikan (IP dari server lain tidak diblokir lagi)." ;;
+                *) echo "Blokir bersama: $([ -f "$SHARED_OFF" ] && echo 'tidak aktif' || echo aktif) (ubah: report shared-blocklist on|off)" ;;
+            esac ;;
+        *) die "Perintah report tidak dikenal (now | setup <url> <token> | allow-reboot on|off | allow-update on|off | shared-blocklist on|off | off | json)" ;;
     esac
+}
+
+# ================================================================== UPDATE ===
+cmd_update() { # update [--check] [--force] [--quiet] -- unduh versi terbaru lalu pasang ulang dengan pengaturan sama
+    need_root; detect_os
+    local check=0 force=0 quiet=0 url="${GISNET_UPDATE_URL:-$UPDATE_URL_DEFAULT}" tmp latest
+    while [ $# -gt 0 ]; do
+        case "$1" in --check) check=1 ;; --force) force=1 ;; --quiet) quiet=1 ;; *) die "Opsi update tidak dikenal: $1" ;; esac; shift
+    done
+    have curl || pkg_install curl >/dev/null 2>&1 || die "curl tidak tersedia."
+    tmp="$(mktemp)"
+    # Repo private: GH_TOKEN=<token read-only> gisnet-secure-ssh update
+    if [ -n "${GH_TOKEN-}" ]; then
+        curl -fsSL --max-time 60 -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/vnd.github.raw' \
+            https://api.github.com/repos/hadynett/fail2ban/contents/gisnet-secure-ssh.sh -o "$tmp" || { rm -f "$tmp"; die "Gagal mengunduh (periksa GH_TOKEN)."; }
+    else
+        curl -fsSL --max-time 60 "$url" -o "$tmp" || { rm -f "$tmp"; die "Gagal mengunduh $url (repo private? pakai GH_TOKEN=...)."; }
+    fi
+    grep -q '^SCRIPT_VERSION=' "$tmp" && bash -n "$tmp" || { rm -f "$tmp"; die "File yang diunduh bukan skrip yang valid -- dibatalkan."; }
+    latest="$(sed -n "s/^SCRIPT_VERSION='\([0-9.]*\)'.*/\1/p" "$tmp" | head -1)"
+    echo "Versi terpasang: $SCRIPT_VERSION · versi terbaru: ${latest:-?}"
+    if [ "$check" -eq 1 ]; then rm -f "$tmp"; return 0; fi
+    if [ "$force" -eq 0 ] && [ "$(printf '%s\n%s\n' "$latest" "$SCRIPT_VERSION" | sort -V | tail -1)" = "$SCRIPT_VERSION" ]; then
+        rm -f "$tmp"; c_ok "Sudah versi terbaru."; return 0
+    fi
+    mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR"
+    [ -f "$SELF_INSTALL" ] && cp -a "$SELF_INSTALL" "$STATE_DIR/gisnet-secure-ssh.prev"
+    install -m 0755 "$tmp" "$SELF_INSTALL"; rm -f "$tmp"
+    c_ok "Skrip diperbarui ke $latest ($SELF_INSTALL; versi lama: $STATE_DIR/gisnet-secure-ssh.prev)."
+    if [ -f "$JAIL" ] && [ -f "$INSTALL_CONF" -o -f "$REPORT_CONF" ]; then
+        c_info "Memasang ulang dengan pengaturan yang sama..."
+        if [ "$quiet" -eq 1 ]; then GISNET_NONINTERACTIVE=1 "$SELF_INSTALL" install </dev/null >/dev/null
+        else GISNET_NONINTERACTIVE=1 "$SELF_INSTALL" install </dev/null; fi
+        [ -f "$REPORT_CONF" ] && { GISNET_NONINTERACTIVE=1 "$SELF_INSTALL" report now quiet </dev/null || true; }
+    else
+        c_info "Belum pernah dipasang lengkap di server ini -- jalankan: gisnet-secure-ssh install"
+    fi
 }
 
 # ==================================================================== MENU ===
@@ -911,7 +1281,7 @@ cmd_menu() {
     need_root; [ -n "$TTY" ] || die "Menu butuh terminal interaktif."
     while :; do
         echo
-        echo "=== gisnet-secure-ssh v$SCRIPT_VERSION -- $(hostname) ==="
+        echo "=== gis-secured v$SCRIPT_VERSION -- $(hostname) ==="
         echo "  1) Status keamanan        5) Ganti / tambah port SSH"
         echo "  2) Kelola whitelist       6) Kembalikan dari cadangan"
         echo "  3) Kelola kunci SSH       7) Kirim laporan ke aplikasi"
@@ -943,8 +1313,10 @@ case "${1-}" in
     port)                 shift; cmd_port "$@" ;;
     restore)              shift; cmd_restore "$@" ;;
     report|laporan)       shift; cmd_report "$@" ;;
+    checks|periksa)       shift; cmd_checks ;;
+    update|perbarui)      shift; cmd_update "$@" ;;
     install|pasang)       shift; cmd_install "$@" ;;
     -h|--help|help)       usage ;;
-    -v|--version|version) echo "gisnet-secure-ssh v$SCRIPT_VERSION" ;;
+    -v|--version|version) echo "gis-secured v$SCRIPT_VERSION (perintah: gisnet-secure-ssh)" ;;
     *)                    cmd_install "$@" ;;
 esac
