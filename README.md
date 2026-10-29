@@ -148,7 +148,44 @@ LoginGraceTime 30
 
 Hanya opsi yang dikenali versi OpenSSH di server tersebut yang ditulis.
 
-**Update keamanan otomatis**: `unattended-upgrades` (Debian/Ubuntu), `dnf-automatic` hanya paket keamanan (Alma/Rocky/RHEL 8+/Fedora), `yum-cron` (CentOS 7). Distro lain dilewati.
+**Update keamanan otomatis**: `unattended-upgrades` (Debian/Ubuntu), `dnf-automatic` hanya paket keamanan (Alma/Rocky/RHEL 8+/Fedora), `yum-cron` (CentOS 7). Distro lain dilewati. Penjelasan lengkap ada di bagian berikut.
+
+## Update keamanan otomatis
+
+Server memasang **perbaikan keamanan sendiri setiap hari**, tanpa perlu login dan menjalankan `apt upgrade` manual.
+
+**Kenapa perlu:** celah keamanan baru ditemukan hampir tiap minggu (OpenSSH, OpenSSL, kernel, dll.). Debian/Ubuntu cepat merilis perbaikannya, tetapi server tetap rawan sampai perbaikan itu dipasang. Server yang jarang disentuh biasanya tertinggal berbulan-bulan, dan celah lama seperti ini yang paling sering dipakai penyerang.
+
+**Cara kerjanya (Debian/Ubuntu):**
+
+- Sekali sehari server memeriksa paket baru dari **repo resmi distro** (perbaikan keamanan & perbaikan bug stabil), lalu langsung memasangnya.
+- **Tidak** menaikkan versi distro (mis. Debian 13 → 14). Itu tetap manual.
+- **Tidak** menyentuh repo pihak lain (mis. repo vendor aplikasi). Paket dari repo itu tetap diperbarui manual.
+- **Tidak** me-restart server. Bila ada update kernel, kernel baru aktif setelah reboot manual di waktu yang aman.
+- Layanan yang paketnya diperbarui kadang ikut restart sebentar (hitungan detik).
+
+Pada Alma/Rocky/RHEL, `dnf-automatic` diatur hanya memasang **paket keamanan** (`upgrade_type = security`).
+
+**Perintah yang berguna (Debian/Ubuntu):**
+
+```bash
+ls /var/log/unattended-upgrades/                                    # catatan apa saja yang sudah dipasang
+tail /var/log/unattended-upgrades/unattended-upgrades.log           # riwayat terakhir
+unattended-upgrade --dry-run -d                                     # lihat apa yang akan dipasang, tanpa memasang
+ls /var/run/reboot-required 2>/dev/null && echo "perlu reboot"      # ada update yang butuh reboot?
+```
+
+Alma/Rocky/RHEL: `systemctl list-timers 'dnf-automatic*'` dan `journalctl -u dnf-automatic.service`.
+
+**Mematikan:**
+
+- Saat pemasangan: tambahkan `--no-auto-update`.
+- Setelah terpasang (Debian/Ubuntu): ubah kedua `"1"` menjadi `"0"` di `/etc/apt/apt.conf.d/20auto-upgrades`.
+- Alma/Rocky/RHEL: `systemctl disable --now dnf-automatic.timer`.
+
+Saran: biarkan aktif. Yang dipasang hanya perbaikan resmi distro, jadi risikonya kecil, sedangkan manfaatnya besar untuk server yang terbuka ke internet.
+
+**Catatan:** bila `apt` menampilkan peringatan seperti `Signing key ... SHA1 is not considered secure` untuk repo pihak lain, itu masalah repo tersebut (kuncinya masih SHA1, ditolak Debian 13 sejak 2026-02-01), bukan skrip ini. Paket dari repo itu tidak ikut ter-update sampai vendornya memperbarui kunci. Update resmi Debian tetap berjalan normal.
 
 ## Pengaman
 
