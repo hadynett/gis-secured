@@ -123,6 +123,35 @@ gisnet-secure-ssh report off                           # matikan
 
 URL dan token didapat dari aplikasi pemantau. Token disimpan di `/etc/gisnet-secure-ssh/report.conf` (hanya bisa dibaca root). Isi laporan berupa JSON yang dikirim dengan `Authorization: Bearer <token>`. Laporan tidak memuat kunci atau password.
 
+#### Langkah lengkap: server baru sampai tampil di aplikasi
+
+```bash
+# 1. Pasang skrip (lihat dulu rencananya dengan --dry-run)
+curl -fsSL https://raw.githubusercontent.com/hadynett/fail2ban/main/gisnet-secure-ssh.sh -o gisnet-secure-ssh.sh
+sudo bash gisnet-secure-ssh.sh --dry-run
+sudo bash gisnet-secure-ssh.sh
+
+# 2. Di aplikasi: menu Keamanan Server > Tambah Server, isi nama, lalu salin perintah yang muncul:
+gisnet-secure-ssh report setup <url-laporan> <token>
+
+# 3. (Opsional) izinkan reboot dari aplikasi
+gisnet-secure-ssh report allow-reboot on
+```
+
+Setelah langkah 2 kartu server muncul di aplikasi. Setelah langkah 3 tombol **Reboot** di kartu itu langsung aktif.
+
+#### Memperbarui server yang sudah terpasang
+
+Pasang ulang dengan skrip terbaru. Kunci dan whitelist yang sudah ada tetap dipakai: cukup tekan **Enter** di kedua pertanyaan. Pengaturan laporan juga tetap.
+
+```bash
+rm -f gisnet-secure-ssh.sh
+curl -fsSL https://raw.githubusercontent.com/hadynett/fail2ban/main/gisnet-secure-ssh.sh -o gisnet-secure-ssh.sh
+bash gisnet-secure-ssh.sh --version        # pastikan versi terbaru (GitHub kadang telat ±5 menit)
+sudo bash gisnet-secure-ssh.sh
+gisnet-secure-ssh report allow-reboot on   # bila ingin reboot dari aplikasi (v2.3+)
+```
+
 #### Reboot dari aplikasi (opsional, mulai v2.3)
 
 Aplikasi pemantau bisa meminta server **reboot sekarang**, **reboot jam 00.00**, atau **membatalkan jadwal reboot**. Permintaan ikut di balasan laporan berikutnya (maksimal 5 menit), jadi aplikasi tidak pernah masuk ke server.
