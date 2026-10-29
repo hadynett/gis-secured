@@ -35,6 +35,7 @@
 #     report [now|setup <url> <token> [--allow-reboot]|off]   laporan status ke aplikasi
 #     report allow-reboot on|off             izinkan reboot (sekarang / 00.00 / batal) dari aplikasi
 #     report allow-update on|off             izinkan update skrip dari aplikasi
+#     report allow-port on|off               izinkan ganti port SSH dari aplikasi (dua langkah)
 #     report shared-blocklist on|off         blokir bersama: IP penyerang dari server GISNET lain
 #     update [--check] [--force]             perbarui skrip ke versi terbaru, pengaturan tetap
 #     checks                                 pemeriksaan: kesehatan, port terbuka, proses, login SSH (JSON)
@@ -47,7 +48,7 @@
 # =============================================================================
 set -euo pipefail
 
-SCRIPT_VERSION='2.5'
+SCRIPT_VERSION='2.6'
 SELF_INSTALL=/usr/local/sbin/gisnet-secure-ssh
 STATE_DIR=/etc/gisnet-secure-ssh
 REPORT_CONF="$STATE_DIR/report.conf"
@@ -56,6 +57,7 @@ INSTALL_CONF="$STATE_DIR/install.conf"     # opsi pemasangan, dipakai ulang oleh
 WEB_PROXY_STATE="$STATE_DIR/web-proxy"     # cloudflare | proxy -- jail web dilewati
 SHARED_OFF="$STATE_DIR/shared-blocklist-off"
 ALLOW_UPDATE="$STATE_DIR/allow-update"
+ALLOW_PORT="$STATE_DIR/allow-port"
 UPDATE_URL_DEFAULT='https://raw.githubusercontent.com/hadynett/gis-secured/main/gisnet-secure-ssh.sh'
 JAIL=/etc/fail2ban/jail.d/gisnet.local
 F2B_LOG=/var/log/fail2ban.log
@@ -677,6 +679,7 @@ cmd_status() {
     echo " Update otomatis: $(auto_update_status)"
     echo " Laporan       : $([ -f "$REPORT_CONF" ] && . "$REPORT_CONF" && echo "aktif ke $REPORT_URL" || echo 'tidak aktif')"
     echo " Reboot via app: $([ -f "$ALLOW_REBOOT" ] && echo diizinkan || echo 'tidak diizinkan')$( s="$(reboot_scheduled_at)"; [ -n "$s" ] && echo " · terjadwal $(date -d "@$s" '+%d/%m %H:%M')" )"
+    echo " Port via app  : $([ -f "$ALLOW_PORT" ] && echo diizinkan || echo 'tidak diizinkan')"
     echo " Update via app: $([ -f "$ALLOW_UPDATE" ] && echo diizinkan || echo 'tidak diizinkan') · blokir bersama: $([ -f "$SHARED_OFF" ] && echo 'tidak aktif' || echo aktif)"
     [ -f "$WEB_PROXY_STATE" ] && echo " Jail web      : dilewati -- website di belakang $(cat "$WEB_PROXY_STATE")"
     # --- pemeriksaan server
@@ -902,7 +905,7 @@ cmd_port() {
     apply_ssh "${pw:-no}" "$newports"
     if [ -f "$JAIL" ]; then
         backup "$JAIL"
-        awk -v v="$newports" '/^\[/{s=$0} (s=="[sshd]"||s=="[recidive]") && /^[[:space:]]*port[[:space:]]*=/{print "port      = " v; next} {print}' "$JAIL" > "$JAIL.tmp" && cat "$JAIL.tmp" > "$JAIL" && rm -f "$JAIL.tmp"
+        awk -v v="$newports" '/^\[/{s=$0} (s=="[sshd]"||s=="[recidive]"||s=="[gisnet-shared]") && /^[[:space:]]*port[[:space:]]*=/{print "port      = " v; next} {print}' "$JAIL" > "$JAIL.tmp" && cat "$JAIL.tmp" > "$JAIL" && rm -f "$JAIL.tmp"
         f2b_reload || true
     fi
     if [ "$remove_old" -eq 1 ]; then c_ok "SSH sekarang hanya di port $p."
@@ -1062,7 +1065,8 @@ report_json() {
     root="$("$SSHD_BIN" -T 2>/dev/null | awk '$1=="permitrootlogin"{print $2}')"
     ports="$(ssh_ports)"
     ip="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
-    local allow=false reboot_req=false sched allow_up=false shared=false banned_ips=''
+    local allow=false reboot_req=false sched allow_up=false shared=false banned_ips='' allow_port=false
+    [ -f "$ALLOW_PORT" ] && allow_port=true
     [ -f "$ALLOW_REBOOT" ] && allow=true
     [ -f "$ALLOW_UPDATE" ] && allow_up=true
     [ ! -f "$SHARED_OFF" ] && fail2ban-client status gisnet-shared >/dev/null 2>&1 && shared=true
@@ -1071,11 +1075,11 @@ report_json() {
     fi
     [ -f /var/run/reboot-required ] && reboot_req=true
     sched="$(reboot_scheduled_at)"
-    printf '{"version":%s,"hostname":%s,"os":%s,"ip":%s,"uptime_seconds":%s,"fail2ban_running":%s,"jails":[%s],"whitelist":%s,"ssh":{"ports":%s,"password_auth":%s,"root_login":%s},"auto_update":%s,"recent_bans":[%s],"allow_reboot":%s,"reboot_required":%s,"reboot_scheduled_at":%s,"allow_update":%s,"shared_blocklist":%s,"banned_ips":[%s],%s,"generated_at":%s}\n' \
+    printf '{"version":%s,"hostname":%s,"os":%s,"ip":%s,"uptime_seconds":%s,"fail2ban_running":%s,"jails":[%s],"whitelist":%s,"ssh":{"ports":%s,"password_auth":%s,"root_login":%s},"auto_update":%s,"recent_bans":[%s],"allow_reboot":%s,"reboot_required":%s,"reboot_scheduled_at":%s,"allow_update":%s,"allow_port":%s,"shared_blocklist":%s,"banned_ips":[%s],%s,"generated_at":%s}\n' \
         "$(json_str "$SCRIPT_VERSION")" "$(json_str "$(hostname)")" "$(json_str "$OS_NAME")" "$(json_str "$ip")" \
         "$(awk '{print int($1)}' /proc/uptime 2>/dev/null || echo 0)" "$running" "$jails" \
         "$(json_str "$(wl_current | paste -sd' ' - || true)")" "$(json_str "$ports")" "$(json_str "${pw:-}")" "$(json_str "${root:-}")" \
-        "$(json_str "$(auto_update_status)")" "$recent" "$allow" "$reboot_req" "${sched:-null}" "$allow_up" "$shared" "$banned_ips" "$(checks_fields)" "$(date +%s)"
+        "$(json_str "$(auto_update_status)")" "$recent" "$allow" "$reboot_req" "${sched:-null}" "$allow_up" "$allow_port" "$shared" "$banned_ips" "$(checks_fields)" "$(date +%s)"
 }
 reboot_scheduled_at() { # epoch detik jadwal reboot systemd, kosong bila tidak ada
     local usec
@@ -1109,6 +1113,26 @@ report_send() {
     report_apply_reboot "$body"
     report_apply_shared "$body"
     report_apply_update "$body"
+    report_apply_port "$body"
+}
+report_apply_port() { # report_apply_port <balasan-json> -- {"ssh_port":{"action":"add|remove_old","port":N}}, perlu izin
+    local m action port
+    m="$(printf '%s' "$1" | grep -oE '"ssh_port" *: *\{ *"action" *: *"(add|remove_old)" *, *"port" *: *[0-9]{1,5} *\}' | head -1 || true)"
+    [ -n "$m" ] || return 0
+    action="$(printf '%s' "$m" | grep -oE '(add|remove_old)' | head -1)"
+    port="$(printf '%s' "$m" | grep -oE '[0-9]{1,5} *\}' | tr -dc '0-9')"
+    if [ ! -f "$ALLOW_PORT" ]; then c_warn "Aplikasi meminta ganti port SSH, tetapi server ini tidak mengizinkan."; return 0; fi
+    if ! { [ "$port" = 22 ] || { [ "$port" -ge 1024 ] && [ "$port" -le 65535 ]; }; }; then
+        c_warn "Port $port ditolak (hanya 22 atau 1024-65535)."; return 0
+    fi
+    logger -t gisnet-secure-ssh "port SSH $action $port diminta dari aplikasi" 2>/dev/null || true
+    # Jalan di latar belakang: SSH dimuat ulang, lalu laporan baru dikirim supaya aplikasi melihat hasilnya.
+    ( {
+        if [ "$action" = remove_old ]; then GISNET_NONINTERACTIVE=1 "$SELF_INSTALL" port "$port" --remove-old </dev/null
+        else GISNET_NONINTERACTIVE=1 "$SELF_INSTALL" port "$port" </dev/null; fi
+        GISNET_NONINTERACTIVE=1 "$SELF_INSTALL" report now quiet </dev/null
+      } >> /var/log/gisnet-secure-ssh-port.log 2>&1 & ) 2>/dev/null || true
+    c_ok "Permintaan port SSH ($action $port) dijalankan (log: /var/log/gisnet-secure-ssh-port.log)."
 }
 report_apply_shared() { # report_apply_shared <balasan-json> -- IP dari server lain, port SSH saja
     [ -f "$SHARED_OFF" ] && return 0
@@ -1209,6 +1233,7 @@ cmd_report() {
                     --no-allow-reboot) reboot=no ;;
                     --allow-update) upd=yes ;;
                     --no-allow-update) upd=no ;;
+                    --allow-port) mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR"; touch "$ALLOW_PORT"; chmod 600 "$ALLOW_PORT"; c_ok "Ganti port SSH dari aplikasi DIIZINKAN." ;;
                     *) if [ -z "$url" ]; then url="$a"; elif [ -z "$token" ]; then token="$a"; fi ;;
                 esac
             done
@@ -1223,6 +1248,15 @@ cmd_report() {
                 off|tidak) allow_reboot_set off; [ -f "$REPORT_CONF" ] && { report_send quiet || true; } ;;
                 *) echo "Reboot dari aplikasi: $([ -f "$ALLOW_REBOOT" ] && echo diizinkan || echo 'tidak diizinkan') (ubah: report allow-reboot on|off)" ;;
             esac ;;
+        allow-port|izin-port)
+            case "${2-}" in
+                on|ya) mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR"; touch "$ALLOW_PORT"; chmod 600 "$ALLOW_PORT"
+                       c_ok "Ganti port SSH dari aplikasi DIIZINKAN (tambah port baru; port lama ditutup hanya setelah port baru terbukti bisa dihubungi)."
+                       [ -f "$REPORT_CONF" ] && { report_send quiet || true; } ;;
+                off|tidak) rm -f "$ALLOW_PORT"; c_ok "Ganti port SSH dari aplikasi tidak diizinkan."
+                       [ -f "$REPORT_CONF" ] && { report_send quiet || true; } ;;
+                *) echo "Ganti port SSH dari aplikasi: $([ -f "$ALLOW_PORT" ] && echo diizinkan || echo 'tidak diizinkan') (ubah: report allow-port on|off)" ;;
+            esac ;;
         allow-update|izin-update)
             case "${2-}" in
                 on|ya) allow_update_set on; [ -f "$REPORT_CONF" ] && { report_send quiet || true; } ;;
@@ -1235,7 +1269,7 @@ cmd_report() {
                 off|tidak) mkdir -p "$STATE_DIR"; touch "$SHARED_OFF"; fail2ban-client unban --all >/dev/null 2>&1 || true; c_ok "Blokir bersama dimatikan (IP dari server lain tidak diblokir lagi)." ;;
                 *) echo "Blokir bersama: $([ -f "$SHARED_OFF" ] && echo 'tidak aktif' || echo aktif) (ubah: report shared-blocklist on|off)" ;;
             esac ;;
-        *) die "Perintah report tidak dikenal (now | setup <url> <token> | allow-reboot on|off | allow-update on|off | shared-blocklist on|off | off | json)" ;;
+        *) die "Perintah report tidak dikenal (now | setup <url> <token> | allow-reboot on|off | allow-update on|off | allow-port on|off | shared-blocklist on|off | off | json)" ;;
     esac
 }
 

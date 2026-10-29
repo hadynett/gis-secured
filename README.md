@@ -140,6 +140,10 @@ gisnet-secure-ssh port 2269 --remove-old   # 3. bila berhasil, tutup port lama
 
 Skrip otomatis membuka port di **firewalld / ufw**, mendaftarkannya di **SELinux** (`semanage port`), menangani `ssh.socket` di Ubuntu baru, dan memperbarui port jail fail2ban.
 
+#### Ganti port dari aplikasi (mulai v2.6)
+
+Bila diizinkan (`gisnet-secure-ssh report allow-port on`), port SSH juga bisa diganti dari aplikasi pemantau dengan dua langkah yang sama: **tambah port baru** (port lama tetap dibuka), lalu **tutup port lama** — tombolnya baru aktif setelah port baru terlihat aktif di laporan dan aplikasi berhasil terhubung ke port itu. Hanya port 22 atau 1024–65535 yang diterima.
+
 ### Kembalikan dari cadangan
 
 ```bash
