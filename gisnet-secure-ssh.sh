@@ -267,21 +267,35 @@ cmd_install() {
     if [ -n "$R_URL$R_TOKEN" ]; then [ -n "$R_URL" ] && [ -n "$R_TOKEN" ] || die "--report-url dan --report-token harus diisi keduanya."; fi
     c_info "Sistem: $OS_NAME ($PKG, $([ "$HAS_SYSTEMD" -eq 1 ] && echo systemd || echo tanpa systemd))"
 
-    # --- kunci publik
+    # --- kunci publik (root yang sudah punya kunci, mis. dari v1: Enter = pakai kunci yang ada)
+    local EXISTING_KEYS
+    EXISTING_KEYS="$(grep -cE '(^|[[:space:]])(ssh-ed25519|ssh-rsa|ecdsa-sha2-[a-z0-9]+|sk-[a-z0-9@.-]+) ' "$(key_file_of root)" 2>/dev/null || true)"; EXISTING_KEYS="${EXISTING_KEYS:-0}"
     if [ "${#KEYS[@]}" -eq 0 ]; then
-        [ -n "$TTY" ] || die "Tidak ada terminal untuk bertanya -- berikan kunci lewat --key \"ssh-ed25519 AAAA...\"."
-        echo
-        echo "Tempel KUNCI PUBLIK SSH Anda (isi file .pub, diawali ssh-ed25519 / ssh-rsa / ecdsa-sha2-...)."
-        echo "Satu kunci per baris; tekan Enter pada baris kosong bila selesai."
-        local line
-        while :; do
-            line="$(ask "Kunci publik #$(( ${#KEYS[@]} + 1 )): " | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
-            if [ -z "$line" ]; then [ "${#KEYS[@]}" -gt 0 ] && break; c_warn "Minimal satu kunci publik."; continue; fi
-            if valid_key "$line"; then KEYS+=("$line"); c_ok "Kunci diterima (${line##* })."
-            else c_warn "Bukan kunci publik SSH yang valid (pastikan isi file .pub, bukan kunci privat)."; fi
-        done
+        if [ -z "$TTY" ]; then
+            [ "$EXISTING_KEYS" -gt 0 ] || die "Tidak ada terminal untuk bertanya -- berikan kunci lewat --key \"ssh-ed25519 AAAA...\"."
+            c_info "Memakai $EXISTING_KEYS kunci root yang sudah terpasang."
+        else
+            echo
+            echo "Tempel KUNCI PUBLIK SSH Anda (isi file .pub, diawali ssh-ed25519 / ssh-rsa / ecdsa-sha2-...)."
+            if [ "$EXISTING_KEYS" -gt 0 ]; then
+                echo "Root sudah punya $EXISTING_KEYS kunci -- tekan Enter saja untuk tetap memakainya, atau tempel kunci tambahan."
+            else
+                echo "Satu kunci per baris; tekan Enter pada baris kosong bila selesai."
+            fi
+            local line
+            while :; do
+                line="$(ask "Kunci publik #$(( ${#KEYS[@]} + 1 )): " | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+                if [ -z "$line" ]; then
+                    { [ "${#KEYS[@]}" -gt 0 ] || [ "$EXISTING_KEYS" -gt 0 ]; } && break
+                    c_warn "Minimal satu kunci publik."; continue
+                fi
+                if valid_key "$line"; then KEYS+=("$line"); c_ok "Kunci diterima (${line##* })."
+                else c_warn "Bukan kunci publik SSH yang valid (pastikan isi file .pub, bukan kunci privat)."; fi
+            done
+            [ "${#KEYS[@]}" -eq 0 ] && c_ok "Memakai $EXISTING_KEYS kunci root yang sudah terpasang."
+        fi
     fi
-    local k; for k in "${KEYS[@]}"; do valid_key "$k" || die "Kunci publik tidak valid: ${k:0:40}..."; done
+    local k; for k in ${KEYS[@]+"${KEYS[@]}"}; do valid_key "$k" || die "Kunci publik tidak valid: ${k:0:40}..."; done
 
     # --- whitelist
     if [ "$WL_GIVEN" -eq 0 ] && [ -n "$TTY" ]; then
@@ -304,7 +318,7 @@ cmd_install() {
     if [ "$DRY" -eq 1 ]; then
         echo; c_info "MODE UJI (--dry-run): tidak ada yang diubah."
         c_plan "Pasang paket: fail2ban$([ "$PKG" = apt ] && [ "$HAS_SYSTEMD" -eq 1 ] && echo ' python3-systemd')$( { [ "$PKG" = dnf ] || [ "$PKG" = yum ]; } && [ "$OS_ID" != fedora ] && echo ' (dari EPEL)')"
-        c_plan "Kunci publik untuk root${EXTRA_USERS[*]:+ & ${EXTRA_USERS[*]}}: $(for k in "${KEYS[@]}"; do printf '%s ' "${k##* }"; done)"
+        c_plan "Kunci publik untuk root${EXTRA_USERS[*]:+ & ${EXTRA_USERS[*]}}: $(for k in ${KEYS[@]+"${KEYS[@]}"}; do printf '%s ' "${k##* }"; done)$([ "$EXISTING_KEYS" -gt 0 ] && echo "(+ $EXISTING_KEYS kunci yang sudah ada)")"
         c_plan "Port SSH: $PORTS$([ -n "$NEW_PORT" ] && echo " (port baru $NEW_PORT, port lama tetap dibuka)")"
         c_plan "Login password SSH: $([ "$PW" = no ] && echo 'DIMATIKAN (kunci saja)' || echo 'tetap aktif')"
         c_plan "Update keamanan otomatis: $([ "$AUTO_UPDATE" -eq 1 ] && echo ya || echo tidak)"
@@ -322,8 +336,8 @@ cmd_install() {
 
     # --- 1. kunci SSH
     local KEY_OK=0 u
-    install_keys root "${KEYS[@]}" && KEY_OK=1
-    for u in ${EXTRA_USERS[@]+"${EXTRA_USERS[@]}"}; do install_keys "$u" "${KEYS[@]}" || true; done
+    install_keys root ${KEYS[@]+"${KEYS[@]}"} && KEY_OK=1
+    for u in ${EXTRA_USERS[@]+"${EXTRA_USERS[@]}"}; do install_keys "$u" ${KEYS[@]+"${KEYS[@]}"} || true; done
     [ "$KEEP_PASSWORD" -eq 0 ] && [ "$KEY_OK" -ne 1 ] && { PW=yes; c_warn "Kunci root belum terverifikasi -- login password SSH TETAP aktif supaya Anda tidak terkunci."; }
 
     # --- 2. fail2ban
