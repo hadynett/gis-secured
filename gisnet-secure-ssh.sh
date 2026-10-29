@@ -39,7 +39,7 @@
 # =============================================================================
 set -euo pipefail
 
-VERSION='2.1'
+SCRIPT_VERSION='2.2'
 SELF_INSTALL=/usr/local/sbin/gisnet-secure-ssh
 STATE_DIR=/etc/gisnet-secure-ssh
 REPORT_CONF="$STATE_DIR/report.conf"
@@ -83,9 +83,9 @@ need_root() { [ "$(id -u)" -eq 0 ] || die "Jalankan sebagai root (sudo)."; }
 
 # ------------------------------------------------------------- deteksi OS ---
 detect_os() {
-    [ -r /etc/os-release ] && . /etc/os-release || true
-    OS_ID="${ID:-unknown}"
-    OS_NAME="${PRETTY_NAME:-$OS_ID}"
+    # Dibaca di subshell: os-release juga punya VERSION/ID yang tidak boleh menimpa variabel skrip.
+    OS_ID="$( . /etc/os-release 2>/dev/null; echo "${ID:-unknown}")"
+    OS_NAME="$( . /etc/os-release 2>/dev/null; echo "${PRETTY_NAME:-}")"; OS_NAME="${OS_NAME:-$OS_ID}"
     PKG=''
     if have apt-get; then PKG=apt
     elif have dnf; then PKG=dnf
@@ -169,7 +169,7 @@ EOF
 gen_jail() { # gen_jail <whitelist> <banaction> <ports> <sshd-log> [weblog]
     local wl="$1" ba="$2" ports="$3" sshdlog="$4" weblog="${5-}"
     cat <<EOF
-# fail2ban -- dipasang gisnet-secure-ssh.sh v$VERSION ($(date '+%Y-%m-%d %H:%M'))
+# fail2ban -- dipasang gisnet-secure-ssh.sh v$SCRIPT_VERSION ($(date '+%Y-%m-%d %H:%M'))
 # Semua blokir HANYA port yang diserang (bukan semua port) -- aman untuk IP NAT bersama.
 [DEFAULT]
 ignoreip  = $wl
@@ -434,10 +434,10 @@ apply_ssh() { # apply_ssh <yes|no> [daftar-port-koma]
     local body; body="$( [ -n "$ports" ] && printf 'Port %s\n' $(printf '%s' "$ports" | tr ',' ' '); printf '%s\n' "$settings")"
     if grep -qiE '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d/\*\.conf' "$SSHD_CONFIG"; then
         mkdir -p "$DROPIN_DIR"; backup "$DROPIN"
-        { echo "# pengetatan SSH (gisnet-secure-ssh.sh v$VERSION)"; printf '%s\n' "$body"; } > "$DROPIN"; chmod 644 "$DROPIN"
+        { echo "# pengetatan SSH (gisnet-secure-ssh.sh v$SCRIPT_VERSION)"; printf '%s\n' "$body"; } > "$DROPIN"; chmod 644 "$DROPIN"
     else
         sed -i '/^# >>> gisnet-secure-ssh/,/^# <<< gisnet-secure-ssh/d' "$SSHD_CONFIG"
-        { echo "# >>> gisnet-secure-ssh v$VERSION"; printf '%s\n' "$body"; echo "# <<< gisnet-secure-ssh"; cat "$SSHD_CONFIG"; } > "$SSHD_CONFIG.gisnet-tmp"
+        { echo "# >>> gisnet-secure-ssh v$SCRIPT_VERSION"; printf '%s\n' "$body"; echo "# <<< gisnet-secure-ssh"; cat "$SSHD_CONFIG"; } > "$SSHD_CONFIG.gisnet-tmp"
         cat "$SSHD_CONFIG.gisnet-tmp" > "$SSHD_CONFIG"; rm -f "$SSHD_CONFIG.gisnet-tmp"
     fi
     if ! "$SSHD_BIN" -t 2>/tmp/gisnet-sshd-test.err; then
@@ -791,7 +791,7 @@ report_json() {
     ports="$(ssh_ports)"
     ip="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
     printf '{"version":%s,"hostname":%s,"os":%s,"ip":%s,"uptime_seconds":%s,"fail2ban_running":%s,"jails":[%s],"whitelist":%s,"ssh":{"ports":%s,"password_auth":%s,"root_login":%s},"auto_update":%s,"recent_bans":[%s],"generated_at":%s}\n' \
-        "$(json_str "$VERSION")" "$(json_str "$(hostname)")" "$(json_str "$OS_NAME")" "$(json_str "$ip")" \
+        "$(json_str "$SCRIPT_VERSION")" "$(json_str "$(hostname)")" "$(json_str "$OS_NAME")" "$(json_str "$ip")" \
         "$(awk '{print int($1)}' /proc/uptime 2>/dev/null || echo 0)" "$running" "$jails" \
         "$(json_str "$(wl_current | paste -sd' ' - || true)")" "$(json_str "$ports")" "$(json_str "${pw:-}")" "$(json_str "${root:-}")" \
         "$(json_str "$(auto_update_status)")" "$recent" "$(date +%s)"
@@ -840,7 +840,7 @@ cmd_menu() {
     need_root; [ -n "$TTY" ] || die "Menu butuh terminal interaktif."
     while :; do
         echo
-        echo "=== gisnet-secure-ssh v$VERSION -- $(hostname) ==="
+        echo "=== gisnet-secure-ssh v$SCRIPT_VERSION -- $(hostname) ==="
         echo "  1) Status keamanan        5) Ganti / tambah port SSH"
         echo "  2) Kelola whitelist       6) Kembalikan dari cadangan"
         echo "  3) Kelola kunci SSH       7) Kirim laporan ke aplikasi"
@@ -874,6 +874,6 @@ case "${1-}" in
     report|laporan)       shift; cmd_report "$@" ;;
     install|pasang)       shift; cmd_install "$@" ;;
     -h|--help|help)       usage ;;
-    -v|--version|version) echo "gisnet-secure-ssh v$VERSION" ;;
+    -v|--version|version) echo "gisnet-secure-ssh v$SCRIPT_VERSION" ;;
     *)                    cmd_install "$@" ;;
 esac
