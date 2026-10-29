@@ -95,7 +95,7 @@ gisnet-secure-ssh update           # unduh, ganti, pasang ulang (kunci, whitelis
 Ikut di `status` dan di laporan ke aplikasi:
 
 - **Kesehatan**: load CPU, RAM, swap, disk.
-- **Port berbahaya terbuka**: layanan yang mendengarkan di alamat publik, mis. MySQL/MariaDB 3306, Redis 6379, GenieACS NBI 7557, MongoDB, Docker API, Webmin. Bila memang perlu terbuka (mis. hanya untuk server tertentu lewat firewall), tandai aman di aplikasi.
+- **Port berbahaya terbuka**: layanan yang mendengarkan di alamat publik, mis. MySQL/MariaDB 3306, Redis 6379, GenieACS NBI 7557, MongoDB, Docker API, Webmin. Mulai v2.8 aturan firewall ikut dibaca (firewalld, ufw, nftables, iptables): port yang ditutup atau hanya dibuka untuk IP tertentu tidak dihitung masalah.
 - **Proses mencurigakan**: nama penambang kripto yang dikenal (xmrig, kdevtmpfsi, kinsing, ...), program yang berjalan dari `/tmp`, `/var/tmp`, `/dev/shm`, dan proses yang memakai CPU ≥90% selama 30 menit lebih.
 - **Login SSH** 7 hari terakhir: kapan, user, dari IP mana, metode, dan nama kunci bila cocok.
 

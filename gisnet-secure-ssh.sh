@@ -51,7 +51,7 @@ set -euo pipefail
 # dianggap tidak ada saat perintah datang dari aplikasi (ditemukan 2026-10-29 di server NMS).
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:$PATH}"
 
-SCRIPT_VERSION='2.7'
+SCRIPT_VERSION='2.8'
 SELF_INSTALL=/usr/local/sbin/gisnet-secure-ssh
 STATE_DIR=/etc/gisnet-secure-ssh
 REPORT_CONF="$STATE_DIR/report.conf"
@@ -702,7 +702,7 @@ cmd_status() {
     du="$(df -Pk / 2>/dev/null | tail -1 | awk '{print $(NF-1)}')"
     echo " Kesehatan     : load $l1 / $cpus CPU · RAM $( [ -n "$mt" ] && [ -n "$ma" ] && echo "$(( (mt - ma) * 100 / mt ))%" || echo '?') · disk / ${du:-?}"
     local risky
-    risky="$(checks_ports | grep -oE '"port":[0-9]+,[^}]*"risk":"[^"]+"' | sed -E 's/"port":([0-9]+),.*"risk":"([^"]+)"/\1 (\2)/' | paste -sd',' - || true)"
+    risky="$(checks_ports | grep -oE '\{[^}]*"risk":"[^"]+","firewall":"open"\}' | sed -E 's/.*"port":([0-9]+),.*"risk":"([^"]+)".*/\1 (\2)/' | sort -u | paste -sd',' - || true)"
     [ -n "$risky" ] && printf ' \033[33mPort berbahaya terbuka: %s -- pastikan diblokir firewall dari internet.\033[0m\n' "$risky"
     local susp
     susp="$(checks_processes | grep -oE '"name":"[^"]*","exe":"[^"]*","reason":"[a-z]+"' | sed -E 's/"name":"([^"]*)","exe":"([^"]*)","reason":"([a-z]+)"/\1 [\3] \2/' || true)"
@@ -976,8 +976,71 @@ checks_health() {
         "$(pct "$( [ "${st:-0}" -gt 0 ] && echo $(( (st - ${sf:-0}) * 100 / st )) || echo 0 )")" \
         "$(awk -v k="${dt:-0}" 'BEGIN{v=k/1048576; printf "%.1f", (v<0?0:v)}')" "$(pct "${du:-0}")"
 }
+# Apakah firewall membuka port ini untuk semua orang? open | restricted (hanya IP tertentu) | blocked.
+# Dipakai hanya untuk port berbahaya: port yang sudah ditutup/dibatasi firewall tidak dihitung masalah.
+fw_port_state() { # fw_port_state <port>
+    local p="$1" lines
+    if [ "${HAS_SYSTEMD:-0}" -eq 1 ] && systemctl is-active --quiet firewalld 2>/dev/null; then
+        local z open=0 restr=0 rich zopen zblock svc
+        for z in $( { firewall-cmd --get-active-zones 2>/dev/null | grep -v '^[[:space:]]'; firewall-cmd --get-default-zone 2>/dev/null; } | sort -u); do
+            zopen=0; zblock=0
+            rich="$(firewall-cmd --zone="$z" --list-rich-rules 2>/dev/null | grep -E "port port=\"?$p\"? protocol=\"?tcp" || true)"
+            printf '%s\n' "$rich" | grep -v 'source' | grep -qE '\b(reject|drop)\b' && zblock=1
+            printf '%s\n' "$rich" | grep 'source' | grep -q 'accept' && restr=1
+            printf '%s\n' "$rich" | grep -v 'source' | grep -q 'accept' && zopen=1
+            firewall-cmd -q --zone="$z" --query-port="$p/tcp" 2>/dev/null && zopen=1
+            for svc in $(firewall-cmd --zone="$z" --list-services 2>/dev/null); do
+                firewall-cmd --info-service="$svc" 2>/dev/null | grep -E '^[[:space:]]*ports:' | tr ' ' '\n' | grep -qx "$p/tcp" && zopen=1
+            done
+            [ "$zopen" -eq 1 ] && [ "$zblock" -eq 0 ] && open=1
+        done
+        if [ "$open" -eq 1 ]; then echo open; elif [ "$restr" -eq 1 ]; then echo restricted; else echo blocked; fi
+        return 0
+    fi
+    if have ufw && ufw status 2>/dev/null | grep -q 'Status: active'; then
+        lines="$(ufw status 2>/dev/null | awk -v p="$p" 'NR>4 && ($1 == p || $1 == p"/tcp")')"
+        if printf '%s\n' "$lines" | grep -qE 'ALLOW( IN)?[[:space:]]+Anywhere'; then echo open
+        elif printf '%s\n' "$lines" | grep -q 'ALLOW'; then echo restricted
+        elif printf '%s\n' "$lines" | grep -qE 'DENY|REJECT'; then echo blocked
+        elif ufw status verbose 2>/dev/null | grep -qE 'Default: (deny|reject) \(incoming\)'; then echo blocked
+        else echo open; fi
+        return 0
+    fi
+    if have nft && nft list ruleset >/dev/null 2>&1 && nft list ruleset 2>/dev/null | grep -q 'hook input'; then
+        lines="$(nft list ruleset 2>/dev/null | grep -E "dport (\{[^}]*[ ,]$p[ ,}][^}]*\}|\{ ?$p ?\}|$p\b)" || true)"
+        if nft list ruleset 2>/dev/null | grep -q 'hook input.*policy drop'; then
+            if printf '%s\n' "$lines" | grep 'accept' | grep -qv 'saddr'; then echo open
+            elif printf '%s\n' "$lines" | grep -q 'accept'; then echo restricted
+            else echo blocked; fi
+        else
+            if printf '%s\n' "$lines" | grep -qE '\b(drop|reject)\b' && ! printf '%s\n' "$lines" | grep -E '\b(drop|reject)\b' | grep -q 'saddr'; then echo blocked
+            else echo open; fi
+        fi
+        return 0
+    fi
+    if have iptables && iptables -S INPUT >/dev/null 2>&1; then
+        lines="$(iptables -S INPUT 2>/dev/null | grep -E -- "--dports? ([0-9,:]*,)?$p(,|\b)" || true)"
+        if iptables -S INPUT 2>/dev/null | grep -q '^-P INPUT DROP'; then
+            if printf '%s\n' "$lines" | grep 'ACCEPT' | grep -qv -- '-s '; then echo open
+            elif printf '%s\n' "$lines" | grep -q 'ACCEPT'; then echo restricted
+            else echo blocked; fi
+        else
+            printf '%s\n' "$lines" | grep -E 'DROP|REJECT' | grep -qv -- '-s ' && echo blocked || echo open
+        fi
+        return 0
+    fi
+    echo open
+}
 checks_ports() { # JSON array port TCP yang mendengarkan (bukan loopback)
     have ss || { printf '[]'; return; }
+    local json p
+    json="$(checks_ports_raw)"
+    for p in $(printf '%s' "$json" | grep -oE '"@FW[0-9]+@"' | tr -dc '0-9\n' | sort -u); do
+        json="${json//\"@FW$p@\"/\"$(fw_port_state "$p")\"}"
+    done
+    printf '%s' "$json"
+}
+checks_ports_raw() {
     ss -H -tlnp 2>/dev/null | awk -v risky="$RISKY_PORTS" '
         BEGIN { n = split(risky, r, " "); for (i = 1; i <= n; i++) { split(r[i], kv, ":"); lab[kv[1]] = kv[2]; gsub(/-/, " ", lab[kv[1]]) } }
         {
@@ -988,8 +1051,10 @@ checks_ports() { # JSON array port TCP yang mendengarkan (bukan loopback)
             pub = (addr == "0.0.0.0" || addr == "*" || addr == "::" || (addr !~ /^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|169\.254\.|fe80|fd|fc)/)) ? "true" : "false"
             key = port "|" pub; if (seen[key]++) next
             risk = (pub == "true" && (port in lab)) ? "\"" lab[port] "\"" : "null"
+            fw = (risk != "null") ? "\"@FW" port "@\"" : "null"
+            sub(/ \(.*/, "", proc)   # "cpsrvd (SSL - ...)" -> "cpsrvd"
             gsub(/["\\]/, "", proc); gsub(/["\\]/, "", addr)
-            out = out (out ? "," : "") sprintf("{\"port\":%d,\"proto\":\"tcp\",\"addr\":\"%s\",\"process\":\"%s\",\"public\":%s,\"risk\":%s}", port, addr, proc, pub, risk)
+            out = out (out ? "," : "") sprintf("{\"port\":%d,\"proto\":\"tcp\",\"addr\":\"%s\",\"process\":\"%s\",\"public\":%s,\"risk\":%s,\"firewall\":%s}", port, addr, proc, pub, risk, fw)
             if (++cnt >= 60) exit
         }
         END { printf "[%s]", out }'
