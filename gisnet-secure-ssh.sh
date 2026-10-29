@@ -30,6 +30,7 @@
 #     port <N> [--remove-old]               tambah port SSH; --remove-old menutup port lama
 #     restore [folder-cadangan]             kembalikan pengaturan dari cadangan
 #     report [now|setup <url> <token>|off] laporan status ke aplikasi pemantau
+#     report allow-reboot on|off             izinkan reboot (sekarang / 00.00 / batal) dari aplikasi
 #
 #  PENGAMAN: password SSH baru dimatikan setelah kunci terverifikasi; semua file
 #  dicadangkan (/root/gisnet-secure-ssh-backup-<waktu>/); konfigurasi diuji
@@ -39,10 +40,11 @@
 # =============================================================================
 set -euo pipefail
 
-SCRIPT_VERSION='2.2'
+SCRIPT_VERSION='2.3'
 SELF_INSTALL=/usr/local/sbin/gisnet-secure-ssh
 STATE_DIR=/etc/gisnet-secure-ssh
 REPORT_CONF="$STATE_DIR/report.conf"
+ALLOW_REBOOT="$STATE_DIR/allow-reboot"
 JAIL=/etc/fail2ban/jail.d/gisnet.local
 F2B_LOG=/var/log/fail2ban.log
 SSHD_CONFIG=/etc/ssh/sshd_config
@@ -525,6 +527,7 @@ cmd_status() {
     echo " SSH           : port ${ports:-?} · login password: ${pw:-?} · root: ${root:-?} · kunci root: $keys"
     echo " Update otomatis: $(auto_update_status)"
     echo " Laporan       : $([ -f "$REPORT_CONF" ] && . "$REPORT_CONF" && echo "aktif ke $REPORT_URL" || echo 'tidak aktif')"
+    echo " Reboot via app: $([ -f "$ALLOW_REBOOT" ] && echo diizinkan || echo 'tidak diizinkan')$( s="$(reboot_scheduled_at)"; [ -n "$s" ] && echo " · terjadwal $(date -d "@$s" '+%d/%m %H:%M')" )"
     if [ -f "$F2B_LOG" ]; then
         echo " Blokir terakhir:"
         grep -E 'NOTICE +\[[^]]+\] Ban ' "$F2B_LOG" 2>/dev/null | tail -10 | awk '{for(i=1;i<=NF;i++) if($i=="Ban"){print "   " $1 " " substr($2,1,8) "  " $(i-1) "  " $(i+1)}}' | sed 's/\[\(.*\)\]/\1/' || true
@@ -790,20 +793,46 @@ report_json() {
     root="$("$SSHD_BIN" -T 2>/dev/null | awk '$1=="permitrootlogin"{print $2}')"
     ports="$(ssh_ports)"
     ip="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
-    printf '{"version":%s,"hostname":%s,"os":%s,"ip":%s,"uptime_seconds":%s,"fail2ban_running":%s,"jails":[%s],"whitelist":%s,"ssh":{"ports":%s,"password_auth":%s,"root_login":%s},"auto_update":%s,"recent_bans":[%s],"generated_at":%s}\n' \
+    local allow=false reboot_req=false sched
+    [ -f "$ALLOW_REBOOT" ] && allow=true
+    [ -f /var/run/reboot-required ] && reboot_req=true
+    sched="$(reboot_scheduled_at)"
+    printf '{"version":%s,"hostname":%s,"os":%s,"ip":%s,"uptime_seconds":%s,"fail2ban_running":%s,"jails":[%s],"whitelist":%s,"ssh":{"ports":%s,"password_auth":%s,"root_login":%s},"auto_update":%s,"recent_bans":[%s],"allow_reboot":%s,"reboot_required":%s,"reboot_scheduled_at":%s,"generated_at":%s}\n' \
         "$(json_str "$SCRIPT_VERSION")" "$(json_str "$(hostname)")" "$(json_str "$OS_NAME")" "$(json_str "$ip")" \
         "$(awk '{print int($1)}' /proc/uptime 2>/dev/null || echo 0)" "$running" "$jails" \
         "$(json_str "$(wl_current | paste -sd' ' - || true)")" "$(json_str "$ports")" "$(json_str "${pw:-}")" "$(json_str "${root:-}")" \
-        "$(json_str "$(auto_update_status)")" "$recent" "$(date +%s)"
+        "$(json_str "$(auto_update_status)")" "$recent" "$allow" "$reboot_req" "${sched:-null}" "$(date +%s)"
+}
+reboot_scheduled_at() { # epoch detik jadwal reboot systemd, kosong bila tidak ada
+    local usec
+    usec="$(sed -n 's/^USEC=//p' /run/systemd/shutdown/scheduled 2>/dev/null | head -1 || true)"
+    [[ "$usec" =~ ^[0-9]+$ ]] && echo $((usec / 1000000))
+    return 0
+}
+report_apply_reboot() { # report_apply_reboot <balasan-json> -- hanya now|midnight|cancel, hanya bila diizinkan
+    local when
+    when="$(printf '%s' "$1" | grep -oE '"reboot" *: *"(now|midnight|cancel)"' | grep -oE '(now|midnight|cancel)' | head -1 || true)"
+    [ -n "$when" ] || return 0
+    if [ ! -f "$ALLOW_REBOOT" ]; then c_warn "Aplikasi meminta reboot ($when), tetapi server ini tidak mengizinkan."; return 0; fi
+    case "$when" in
+        now)      shutdown -r +1 "Reboot diminta dari aplikasi GISNET" >/dev/null 2>&1 && c_ok "Reboot dijadwalkan 1 menit lagi (permintaan aplikasi)." ;;
+        midnight) shutdown -r 00:00 "Reboot terjadwal dari aplikasi GISNET" >/dev/null 2>&1 && c_ok "Reboot dijadwalkan jam 00.00 (permintaan aplikasi)." ;;
+        cancel)   shutdown -c >/dev/null 2>&1 || true; c_ok "Jadwal reboot dibatalkan (permintaan aplikasi)." ;;
+    esac
+    logger -t gisnet-secure-ssh "reboot $when diminta dari aplikasi" 2>/dev/null || true
+    # Laporkan jadwal barunya langsung, supaya aplikasi tidak menunggu 5 menit.
+    report_json | curl -sS -o /dev/null --max-time 20 -X POST -H 'Content-Type: application/json' -H 'Accept: application/json' -H "Authorization: Bearer $REPORT_TOKEN" --data-binary @- "$REPORT_URL" >/dev/null 2>&1 || true
 }
 report_send() {
     [ -f "$REPORT_CONF" ] || die "Laporan belum diatur: report setup <url> <token>"
     # shellcheck disable=SC1090
     . "$REPORT_CONF"
     have curl || pkg_install curl >/dev/null 2>&1 || die "curl tidak tersedia."
-    local code
-    code="$(report_json | curl -sS -o /dev/null -w '%{http_code}' --max-time 20 -X POST -H 'Content-Type: application/json' -H 'Accept: application/json' -H "Authorization: Bearer $REPORT_TOKEN" --data-binary @- "$REPORT_URL" || echo 000)"
+    local out code body
+    out="$(report_json | curl -sS -w '\n%{http_code}' --max-time 20 -X POST -H 'Content-Type: application/json' -H 'Accept: application/json' -H "Authorization: Bearer $REPORT_TOKEN" --data-binary @- "$REPORT_URL" 2>/dev/null || echo 000)"
+    code="${out##*$'\n'}"; body="${out%$'\n'*}"; [ "$body" = "$out" ] && body=''
     case "$code" in 2*) [ "${1-}" = quiet ] || c_ok "Laporan terkirim ($code)." ;; *) c_err "Laporan gagal (HTTP $code)."; return 1 ;; esac
+    report_apply_reboot "$body"
 }
 report_setup() { # report_setup <url> <token>
     local url="$1" token="$2"
@@ -831,7 +860,16 @@ cmd_report() {
             report_setup "$url" "$token" ;;
         off|matikan) rm -f "$REPORT_CONF" /etc/cron.d/gisnet-secure-ssh; ( crontab -l 2>/dev/null | grep -v 'gisnet-secure-ssh report' ) | crontab - 2>/dev/null || true; c_ok "Laporan dimatikan." ;;
         json) report_json ;;
-        *) die "Perintah report tidak dikenal (now | setup <url> <token> | off | json)" ;;
+        allow-reboot|izin-reboot)
+            case "${2-}" in
+                on|ya) mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR"; touch "$ALLOW_REBOOT"; chmod 600 "$ALLOW_REBOOT"
+                       c_ok "Reboot dari aplikasi DIIZINKAN (hanya reboot sekarang / jam 00.00 / batal)."
+                       [ -f "$REPORT_CONF" ] && { report_send quiet || true; } ;;
+                off|tidak) rm -f "$ALLOW_REBOOT"; c_ok "Reboot dari aplikasi tidak diizinkan."
+                       [ -f "$REPORT_CONF" ] && { report_send quiet || true; } ;;
+                *) echo "Reboot dari aplikasi: $([ -f "$ALLOW_REBOOT" ] && echo diizinkan || echo 'tidak diizinkan') (ubah: report allow-reboot on|off)" ;;
+            esac ;;
+        *) die "Perintah report tidak dikenal (now | setup <url> <token> | allow-reboot on|off | off | json)" ;;
     esac
 }
 

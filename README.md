@@ -123,6 +123,20 @@ gisnet-secure-ssh report off                           # matikan
 
 URL dan token didapat dari aplikasi pemantau. Token disimpan di `/etc/gisnet-secure-ssh/report.conf` (hanya bisa dibaca root). Isi laporan berupa JSON yang dikirim dengan `Authorization: Bearer <token>`. Laporan tidak memuat kunci atau password.
 
+#### Reboot dari aplikasi (opsional, mulai v2.3)
+
+Aplikasi pemantau bisa meminta server **reboot sekarang**, **reboot jam 00.00**, atau **membatalkan jadwal reboot**. Permintaan ikut di balasan laporan berikutnya (maksimal 5 menit), jadi aplikasi tidak pernah masuk ke server.
+
+```bash
+gisnet-secure-ssh report allow-reboot on    # izinkan
+gisnet-secure-ssh report allow-reboot off   # cabut izin
+gisnet-secure-ssh report allow-reboot       # lihat status
+```
+
+- Default **tidak diizinkan**. Tanpa izin, permintaan dari aplikasi diabaikan.
+- Hanya tiga perintah tetap itu yang dijalankan (`shutdown -r +1`, `shutdown -r 00:00`, `shutdown -c`). Isi lain di balasan aplikasi tidak pernah dijalankan.
+- Laporan juga memuat apakah server **perlu reboot** (ada kernel baru dari update otomatis) dan jadwal reboot yang sedang berjalan.
+
 ## Yang dipasang
 
 **fail2ban** (`/etc/fail2ban/jail.d/gisnet.local`):
