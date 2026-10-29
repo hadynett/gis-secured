@@ -18,6 +18,7 @@
 #     --no-auto-update       jangan pasang update keamanan otomatis
 #     --no-web-jail          jangan pasang jail pemindai web (nginx/apache)
 #     --report-url <url> --report-token <token>   kirim status ke aplikasi pemantau
+#     --allow-reboot / --no-allow-reboot   izinkan / tolak reboot dari aplikasi (tanpa: ditanya)
 #     --dry-run              tampilkan rencana saja
 #
 #  PERINTAH (setelah terpasang, tersedia juga sebagai: gisnet-secure-ssh <perintah>):
@@ -29,7 +30,7 @@
 #     key [list|add|remove] [kunci|nomor] [--user <nama>]   kelola kunci SSH
 #     port <N> [--remove-old]               tambah port SSH; --remove-old menutup port lama
 #     restore [folder-cadangan]             kembalikan pengaturan dari cadangan
-#     report [now|setup <url> <token>|off] laporan status ke aplikasi pemantau
+#     report [now|setup <url> <token> [--allow-reboot]|off]   laporan status ke aplikasi
 #     report allow-reboot on|off             izinkan reboot (sekarang / 00.00 / batal) dari aplikasi
 #
 #  PENGAMAN: password SSH baru dimatikan setelah kunci terverifikasi; semua file
@@ -40,7 +41,7 @@
 # =============================================================================
 set -euo pipefail
 
-SCRIPT_VERSION='2.3'
+SCRIPT_VERSION='2.4'
 SELF_INSTALL=/usr/local/sbin/gisnet-secure-ssh
 STATE_DIR=/etc/gisnet-secure-ssh
 REPORT_CONF="$STATE_DIR/report.conf"
@@ -245,7 +246,7 @@ wl_current() { [ -f "$JAIL" ] && awk '/^[[:space:]]*ignoreip[[:space:]]*=/{sub(/
 
 # ================================================================ INSTALL ===
 cmd_install() {
-    local KEYS=() WL_INPUT='' WL_GIVEN=0 EXTRA_USERS=() KEEP_PASSWORD=0 NEW_PORT='' AUTO_UPDATE=1 WEB_JAIL=1 DRY=0 R_URL='' R_TOKEN=''
+    local KEYS=() WL_INPUT='' WL_GIVEN=0 EXTRA_USERS=() KEEP_PASSWORD=0 NEW_PORT='' AUTO_UPDATE=1 WEB_JAIL=1 DRY=0 R_URL='' R_TOKEN='' R_REBOOT=ask
     while [ $# -gt 0 ]; do
         case "$1" in
             --key) KEYS+=("${2:?--key butuh nilai}"); shift 2 ;;
@@ -257,6 +258,8 @@ cmd_install() {
             --no-web-jail) WEB_JAIL=0; shift ;;
             --report-url) R_URL="${2:?}"; shift 2 ;;
             --report-token) R_TOKEN="${2:?}"; shift 2 ;;
+            --allow-reboot) R_REBOOT=yes; shift ;;
+            --no-allow-reboot) R_REBOOT=no; shift ;;
             --dry-run) DRY=1; shift ;;
             -h|--help) usage ;;
             *) die "Opsi tidak dikenal: $1 (lihat --help)" ;;
@@ -332,6 +335,7 @@ cmd_install() {
         c_plan "Update keamanan otomatis: $([ "$AUTO_UPDATE" -eq 1 ] && echo ya || echo tidak)"
         c_plan "Jail web: ${WEBLOG:-tidak (nginx/apache tidak ditemukan atau --no-web-jail)}"
         c_plan "Laporan ke aplikasi: ${R_URL:-tidak}"
+        c_plan "Reboot dari aplikasi: $(case $R_REBOOT in yes) echo diizinkan ;; no) echo 'tidak diizinkan' ;; *) [ -n "$R_URL" ] && echo 'ditanyakan saat laporan diaktifkan' || echo 'ditanyakan saat report setup' ;; esac)"
         c_plan "Perintah tersedia setelah ini: $SELF_INSTALL"
         echo; echo "----- $JAIL -----"; gen_jail "$WHITELIST" "$BANACTION" "$PORTS" "$SSHDLOG" "$WEBLOG"
         echo; echo "----- $DROPIN (atau awal $SSHD_CONFIG) -----"
@@ -394,7 +398,8 @@ cmd_install() {
 
     # --- 5. perintah sistem + laporan
     install_self
-    [ -n "$R_URL" ] && report_setup "$R_URL" "$R_TOKEN"
+    if [ -n "$R_URL" ]; then report_setup "$R_URL" "$R_TOKEN" "$R_REBOOT"
+    elif [ "$R_REBOOT" != ask ]; then allow_reboot_choose "$R_REBOOT"; fi   # berlaku saat laporan nanti diaktifkan
 
     echo
     echo "================================================================"
@@ -834,11 +839,34 @@ report_send() {
     case "$code" in 2*) [ "${1-}" = quiet ] || c_ok "Laporan terkirim ($code)." ;; *) c_err "Laporan gagal (HTTP $code)."; return 1 ;; esac
     report_apply_reboot "$body"
 }
-report_setup() { # report_setup <url> <token>
-    local url="$1" token="$2"
+allow_reboot_set() { # allow_reboot_set on|off -- tanpa mengirim laporan
+    if [ "$1" = on ]; then
+        mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR"; touch "$ALLOW_REBOOT"; chmod 600 "$ALLOW_REBOOT"
+        c_ok "Reboot dari aplikasi DIIZINKAN (hanya reboot sekarang / jam 00.00 / batal)."
+    else
+        rm -f "$ALLOW_REBOOT"; c_ok "Reboot dari aplikasi tidak diizinkan."
+    fi
+}
+allow_reboot_choose() { # allow_reboot_choose yes|no|ask -- ask: tanya bila ada terminal & belum diizinkan
+    case "$1" in
+        yes) allow_reboot_set on ;;
+        no)  allow_reboot_set off ;;
+        *)
+            if [ -f "$ALLOW_REBOOT" ]; then c_info "Reboot dari aplikasi sudah diizinkan (cabut: report allow-reboot off)."
+            elif [ -n "$TTY" ]; then
+                echo
+                echo "Aplikasi bisa meminta server ini reboot (sekarang / jam 00.00 / batal), mis. setelah update kernel."
+                if confirm "Izinkan reboot dari aplikasi?"; then allow_reboot_set on
+                else c_info "Reboot dari aplikasi tidak diizinkan (ubah kapan saja: report allow-reboot on)."; fi
+            fi ;;
+    esac
+}
+report_setup() { # report_setup <url> <token> [yes|no|ask] -- pilihan izin reboot dari aplikasi
+    local url="$1" token="$2" reboot="${3:-ask}"
     case "$url" in https://*|http://*) ;; *) die "URL laporan harus diawali https://" ;; esac
     mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR"
     printf 'REPORT_URL=%q\nREPORT_TOKEN=%q\n' "$url" "$token" > "$REPORT_CONF"; chmod 600 "$REPORT_CONF"
+    allow_reboot_choose "$reboot"
     install_self
     if [ -d /etc/cron.d ]; then
         printf 'SHELL=/bin/bash\n*/5 * * * * root %s report now quiet >/dev/null 2>&1\n' "$SELF_INSTALL" > /etc/cron.d/gisnet-secure-ssh
@@ -854,19 +882,24 @@ cmd_report() {
     case "${1-now}" in
         now|kirim) report_send "${2-}" ;;
         setup|atur)
-            local url="${2-}" token="${3-}"
+            local url='' token='' reboot=ask a
+            shift
+            for a in "$@"; do
+                case "$a" in
+                    --allow-reboot) reboot=yes ;;
+                    --no-allow-reboot) reboot=no ;;
+                    *) if [ -z "$url" ]; then url="$a"; elif [ -z "$token" ]; then token="$a"; fi ;;
+                esac
+            done
             [ -n "$url" ] || url="$(ask "URL laporan (dari aplikasi): ")"
             [ -n "$token" ] || token="$(ask "Token laporan: ")"
-            report_setup "$url" "$token" ;;
+            report_setup "$url" "$token" "$reboot" ;;
         off|matikan) rm -f "$REPORT_CONF" /etc/cron.d/gisnet-secure-ssh; ( crontab -l 2>/dev/null | grep -v 'gisnet-secure-ssh report' ) | crontab - 2>/dev/null || true; c_ok "Laporan dimatikan." ;;
         json) report_json ;;
         allow-reboot|izin-reboot)
             case "${2-}" in
-                on|ya) mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR"; touch "$ALLOW_REBOOT"; chmod 600 "$ALLOW_REBOOT"
-                       c_ok "Reboot dari aplikasi DIIZINKAN (hanya reboot sekarang / jam 00.00 / batal)."
-                       [ -f "$REPORT_CONF" ] && { report_send quiet || true; } ;;
-                off|tidak) rm -f "$ALLOW_REBOOT"; c_ok "Reboot dari aplikasi tidak diizinkan."
-                       [ -f "$REPORT_CONF" ] && { report_send quiet || true; } ;;
+                on|ya) allow_reboot_set on; [ -f "$REPORT_CONF" ] && { report_send quiet || true; } ;;
+                off|tidak) allow_reboot_set off; [ -f "$REPORT_CONF" ] && { report_send quiet || true; } ;;
                 *) echo "Reboot dari aplikasi: $([ -f "$ALLOW_REBOOT" ] && echo diizinkan || echo 'tidak diizinkan') (ubah: report allow-reboot on|off)" ;;
             esac ;;
         *) die "Perintah report tidak dikenal (now | setup <url> <token> | allow-reboot on|off | off | json)" ;;

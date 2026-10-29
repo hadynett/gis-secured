@@ -49,6 +49,7 @@ sudo bash gisnet-secure-ssh.sh \
 | `--no-auto-update` | jangan pasang update keamanan otomatis |
 | `--no-web-jail` | jangan pasang jail pemindai website |
 | `--report-url <url> --report-token <token>` | kirim status ke aplikasi pemantau tiap 5 menit |
+| `--allow-reboot` / `--no-allow-reboot` | izinkan / tolak reboot dari aplikasi (tanpa opsi ini: ditanyakan) |
 | `--dry-run` | tampilkan rencana & isi file konfigurasi, tanpa mengubah apa pun |
 | `-h`, `--help` | bantuan |
 
@@ -133,12 +134,11 @@ sudo bash gisnet-secure-ssh.sh
 
 # 2. Di aplikasi: menu Keamanan Server > Tambah Server, isi nama, lalu salin perintah yang muncul:
 gisnet-secure-ssh report setup <url-laporan> <token>
-
-# 3. (Opsional) izinkan reboot dari aplikasi
-gisnet-secure-ssh report allow-reboot on
 ```
 
-Setelah langkah 2 kartu server muncul di aplikasi. Setelah langkah 3 tombol **Reboot** di kartu itu langsung aktif.
+Di langkah 2 skrip bertanya **"Izinkan reboot dari aplikasi? [y/N]"**. Jawab `y` supaya tombol **Reboot** di kartu server langsung aktif, atau Enter untuk menolak. Kartu server muncul di aplikasi begitu langkah 2 selesai.
+
+Tanpa pertanyaan: tambahkan `--allow-reboot` (izinkan) atau `--no-allow-reboot` (tolak), mis. `gisnet-secure-ssh report setup <url> <token> --allow-reboot`. Izin bisa diubah kapan saja dengan `report allow-reboot on|off`.
 
 #### Memperbarui server yang sudah terpasang
 
@@ -149,7 +149,7 @@ rm -f gisnet-secure-ssh.sh
 curl -fsSL https://raw.githubusercontent.com/hadynett/fail2ban/main/gisnet-secure-ssh.sh -o gisnet-secure-ssh.sh
 bash gisnet-secure-ssh.sh --version        # pastikan versi terbaru (GitHub kadang telat ±5 menit)
 sudo bash gisnet-secure-ssh.sh
-gisnet-secure-ssh report allow-reboot on   # bila ingin reboot dari aplikasi (v2.3+)
+gisnet-secure-ssh report allow-reboot on   # bila ingin reboot dari aplikasi (v2.3+), bila belum diizinkan
 ```
 
 #### Reboot dari aplikasi (opsional, mulai v2.3)
@@ -157,7 +157,7 @@ gisnet-secure-ssh report allow-reboot on   # bila ingin reboot dari aplikasi (v2
 Aplikasi pemantau bisa meminta server **reboot sekarang**, **reboot jam 00.00**, atau **membatalkan jadwal reboot**. Permintaan ikut di balasan laporan berikutnya (maksimal 5 menit), jadi aplikasi tidak pernah masuk ke server.
 
 ```bash
-gisnet-secure-ssh report allow-reboot on    # izinkan
+gisnet-secure-ssh report allow-reboot on    # izinkan (atau jawab y saat report setup)
 gisnet-secure-ssh report allow-reboot off   # cabut izin
 gisnet-secure-ssh report allow-reboot       # lihat status
 ```
