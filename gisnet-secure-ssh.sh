@@ -300,7 +300,13 @@ cmd_install() {
     # --- whitelist
     if [ "$WL_GIVEN" -eq 0 ] && [ -n "$TTY" ]; then
         echo; echo "IP / subnet yang TIDAK BOLEH diblokir fail2ban (mis. IP kantor). Pisahkan dengan spasi."
-        WL_INPUT="$(ask "Whitelist (Enter untuk lewati): ")"
+        local wl_old; wl_old="$(wl_current | grep -vxF -e 127.0.0.1/8 -e ::1 | paste -sd' ' - || true)"
+        if [ -n "$wl_old" ]; then
+            echo "Whitelist yang sudah ada TETAP dipakai: $wl_old"
+            WL_INPUT="$(ask "IP tambahan (Enter = tidak ada tambahan): ")"
+        else
+            WL_INPUT="$(ask "Whitelist (Enter untuk lewati): ")"
+        fi
     fi
     local WL_EXTRA='' ip
     for ip in $(printf '%s' "$WL_INPUT" | tr ',' ' '); do valid_ip "$ip" || die "IP whitelist tidak valid: $ip"; WL_EXTRA="$WL_EXTRA $ip"; done
