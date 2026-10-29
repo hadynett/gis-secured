@@ -47,8 +47,11 @@
 #  baru di terminal lain.
 # =============================================================================
 set -euo pipefail
+# Cron hanya punya PATH=/usr/bin:/bin -- tanpa ini ufw, shutdown, semanage, nft (di /usr/sbin)
+# dianggap tidak ada saat perintah datang dari aplikasi (ditemukan 2026-10-29 di server NMS).
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:$PATH}"
 
-SCRIPT_VERSION='2.6'
+SCRIPT_VERSION='2.7'
 SELF_INSTALL=/usr/local/sbin/gisnet-secure-ssh
 STATE_DIR=/etc/gisnet-secure-ssh
 REPORT_CONF="$STATE_DIR/report.conf"
@@ -536,7 +539,9 @@ $blk"; c_ok "Jail layanan $name dipasang."
 
     # --- 3. SSH ketat (+ port baru)
     apply_ssh "$PW" "$PORTS"   # port aktif selalu ditulis supaya tidak kembali ke 22
-    [ -n "$NEW_PORT" ] && open_port "$NEW_PORT"
+    # Semua port SSH selain 22 dipastikan terbuka di firewall (memperbaiki port yang dulu
+    # ditambah dari aplikasi saat ufw/firewalld belum terdeteksi -- lihat PATH di atas).
+    local sp; for sp in $(printf '%s' "$PORTS" | tr ',' ' '); do [ "$sp" = 22 ] || open_port "$sp"; done
 
     # --- 4. update keamanan otomatis
     [ "$AUTO_UPDATE" -eq 1 ] && setup_auto_update
@@ -603,15 +608,23 @@ apply_ssh() { # apply_ssh <yes|no> [daftar-port-koma]
 
 open_port() { # buka port SSH baru di SELinux & firewall
     local p="$1"
-    if have getenforce && [ "$(getenforce 2>/dev/null)" != Disabled ]; then
+    if [ "$p" != 22 ] && have getenforce && [ "$(getenforce 2>/dev/null)" != Disabled ]; then
         have semanage || pkg_install policycoreutils-python-utils >/dev/null 2>&1 || pkg_install policycoreutils-python >/dev/null 2>&1 || true
         semanage port -a -t ssh_port_t -p tcp "$p" 2>/dev/null || semanage port -m -t ssh_port_t -p tcp "$p" 2>/dev/null || c_warn "SELinux: gagal mendaftarkan port $p."
     fi
     if [ "$HAS_SYSTEMD" -eq 1 ] && systemctl is-active --quiet firewalld 2>/dev/null; then
-        firewall-cmd -q --permanent --add-port="$p/tcp" && firewall-cmd -q --reload && c_ok "firewalld: port $p dibuka."
+        if firewall-cmd -q --query-port="$p/tcp" 2>/dev/null; then c_info "firewalld: port $p sudah dibuka."
+        else firewall-cmd -q --permanent --add-port="$p/tcp" && firewall-cmd -q --reload && c_ok "firewalld: port $p dibuka."; fi
     elif have ufw && ufw status 2>/dev/null | grep -q 'Status: active'; then
-        ufw allow "$p/tcp" >/dev/null && c_ok "ufw: port $p dibuka."
+        # Port yang sudah punya aturan apa pun (mis. hanya dari IP tertentu) tidak diubah.
+        if ufw status 2>/dev/null | awk 'NR>3{print $1}' | grep -qE "^$p(/tcp)?$"; then c_info "ufw: port $p sudah punya aturan."
+        else ufw allow "$p/tcp" >/dev/null && c_ok "ufw: port $p dibuka."; fi
+    elif have nft && nft list ruleset 2>/dev/null | grep -q 'hook input.*policy drop' && ! nft list ruleset 2>/dev/null | grep -qE "dport (\{[^}]*\b$p\b|$p\b)"; then
+        c_warn "Firewall nftables menolak koneksi masuk dan belum ada aturan untuk port $p -- buka manual, mis.: nft add rule inet filter input tcp dport $p accept (dan simpan di /etc/nftables.conf)."
+    elif have iptables && iptables -S INPUT 2>/dev/null | grep -q '^-P INPUT DROP' && ! iptables -S INPUT 2>/dev/null | grep -qE -- "--dport $p\b"; then
+        c_warn "Firewall iptables menolak koneksi masuk dan belum ada aturan untuk port $p -- buka manual: iptables -I INPUT -p tcp --dport $p -j ACCEPT (lalu simpan)."
     fi
+    return 0
 }
 
 setup_auto_update() {
@@ -1212,7 +1225,7 @@ report_setup() { # report_setup <url> <token> [yes|no|ask] [yes|no|ask] -- izin 
     allow_update_choose "$upd"
     install_self
     if [ -d /etc/cron.d ]; then
-        printf 'SHELL=/bin/bash\n*/5 * * * * root %s report now quiet >/dev/null 2>&1\n' "$SELF_INSTALL" > /etc/cron.d/gisnet-secure-ssh
+        printf 'SHELL=/bin/bash\nPATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n*/5 * * * * root %s report now quiet >/dev/null 2>&1\n' "$SELF_INSTALL" > /etc/cron.d/gisnet-secure-ssh
         chmod 644 /etc/cron.d/gisnet-secure-ssh
     else
         ( crontab -l 2>/dev/null | grep -v 'gisnet-secure-ssh report'; echo "*/5 * * * * $SELF_INSTALL report now quiet >/dev/null 2>&1" ) | crontab -
