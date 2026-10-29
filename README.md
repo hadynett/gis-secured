@@ -41,6 +41,38 @@ sudo bash gisnet-secure-ssh.sh \
 | `--keep-password` | pasang kunci & fail2ban, tetapi login password SSH **tetap** aktif |
 | `-h`, `--help` | bantuan |
 
+## Kelola whitelist (lihat / tambah / hapus)
+
+Setelah terpasang, whitelist bisa dikelola kapan saja dengan skrip yang sama:
+
+```bash
+sudo bash gisnet-secure-ssh.sh whitelist
+```
+
+Menu interaktif muncul:
+
+```
+Whitelist fail2ban (/etc/fail2ban/jail.d/gisnet.local):
+   1. 127.0.0.1/8  (bawaan, tidak bisa dihapus)
+   2. ::1  (bawaan, tidak bisa dihapus)
+   3. 203.0.113.5
+
+  1) Tambah IP    2) Hapus IP    3) Keluar
+Pilih [1-3]:
+```
+
+Atau langsung dengan perintah:
+
+| Perintah | Arti |
+|---|---|
+| `whitelist list` | lihat daftar whitelist |
+| `whitelist add 203.0.113.5 10.0.0.0/8` | tambah satu atau beberapa IP/subnet |
+| `whitelist remove 203.0.113.5` | hapus IP (boleh juga nomor urutnya, mis. `remove 3`) |
+
+Contoh: `sudo bash gisnet-secure-ssh.sh whitelist add 203.0.113.5`
+
+Perubahan langsung berlaku: fail2ban dimuat ulang, dan IP yang baru ditambahkan langsung dibuka blokirnya. Salinan file sebelum diubah disimpan sebagai `gisnet.local.bak-<waktu>`.
+
 ## Yang dipasang
 
 **fail2ban** (`/etc/fail2ban/jail.d/gisnet.local`):

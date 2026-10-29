@@ -31,6 +31,12 @@
 #   --key boleh diulang untuk beberapa kunci; --whitelist berisi IP/subnet
 #   dipisah spasi (IPv4/IPv6, boleh CIDR).
 #
+#  Kelola whitelist (setelah terpasang):
+#     bash gisnet-secure-ssh.sh whitelist                  # menu: lihat / tambah / hapus
+#     bash gisnet-secure-ssh.sh whitelist list             # lihat daftar
+#     bash gisnet-secure-ssh.sh whitelist add 203.0.113.5 10.0.0.0/8
+#     bash gisnet-secure-ssh.sh whitelist remove 203.0.113.5   # atau nomor urutnya
+#
 #  PENTING: JANGAN tutup sesi SSH yang sedang dipakai sebelum mencoba login
 #  baru dengan kunci di jendela/terminal lain.
 # =============================================================================
@@ -50,7 +56,7 @@ c_err()  { printf '\033[31m[XX]\033[0m %s\n' "$*" >&2; }
 die()    { c_err "$*"; exit 1; }
 have()   { command -v "$1" >/dev/null 2>&1; }
 
-usage() { sed -n '2,37p' "${BASH_SOURCE[0]:-$0}" 2>/dev/null | sed 's/^# \{0,1\}//'; exit 0; }
+usage() { awk 'NR>2 && /^# =+$/ {exit} NR>1 {sub(/^# ?/, ""); print}' "${BASH_SOURCE[0]:-$0}" 2>/dev/null; exit 0; }
 
 valid_key() {
     case "$1" in
@@ -62,6 +68,13 @@ valid_key() {
 valid_ip() { # IPv4/IPv6, boleh /CIDR
     printf '%s' "$1" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?$|^[0-9A-Fa-f:]+:[0-9A-Fa-f:.]*(/[0-9]{1,3})?$'
 }
+
+# Perintah kelola whitelist: "whitelist [list|add|remove] [ip ...]".
+WL_MODE=0
+WL_ARGS=()
+if [ "${1-}" = whitelist ]; then
+    WL_MODE=1; shift; WL_ARGS=("$@"); set --
+fi
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -81,6 +94,115 @@ done
 TTY=''
 if [ -r /dev/tty ] && { : < /dev/tty; } 2>/dev/null; then TTY=/dev/tty; fi
 ask() { local prompt="$1" reply=''; printf '%s' "$prompt" > /dev/tty; IFS= read -r reply < /dev/tty || true; printf '%s' "$reply"; }
+
+# ------------------------------------------------- kelola whitelist (IP aman) ---
+# Whitelist = baris "ignoreip" di jail.d/gisnet.local. 127.0.0.1/8 & ::1
+# selalu ada dan tidak bisa dihapus. Setiap perubahan langsung berlaku
+# (fail2ban dimuat ulang) dan IP yang ditambahkan langsung dibuka blokirnya.
+WL_JAIL=/etc/fail2ban/jail.d/gisnet.local
+WL_BUILTIN='127.0.0.1/8 ::1'
+
+wl_current() { # daftar ignoreip saat ini, satu per baris
+    awk -F= '/^[[:space:]]*ignoreip[[:space:]]*=/{sub(/^[^=]*=/, ""); print; exit}' "$WL_JAIL" | tr ' \t' '\n\n' | sed '/^$/d'
+}
+wl_write() { # wl_write <ip ...> -- tulis ulang ignoreip lalu muat ulang fail2ban
+    local list="$WL_BUILTIN" ip
+    for ip in "$@"; do case " $list " in *" $ip "*) ;; *) list="$list $ip" ;; esac; done
+    cp -a "$WL_JAIL" "$WL_JAIL.bak-$(date +%Y%m%d-%H%M%S)"
+    awk -v v="$list" '/^[[:space:]]*ignoreip[[:space:]]*=/{print "ignoreip  = " v; next} {print}' "$WL_JAIL" > "$WL_JAIL.tmp" && cat "$WL_JAIL.tmp" > "$WL_JAIL" && rm -f "$WL_JAIL.tmp"
+    if fail2ban-client reload >/dev/null 2>&1; then c_ok "fail2ban dimuat ulang -- whitelist berlaku."
+    else c_warn "Gagal memuat ulang fail2ban -- jalankan: fail2ban-client reload"; fi
+}
+wl_list() {
+    echo
+    echo "Whitelist fail2ban ($WL_JAIL):"
+    local ip n=0
+    while read -r ip; do
+        n=$((n + 1))
+        case " $WL_BUILTIN " in
+            *" $ip "*) printf '  %2d. %s  (bawaan, tidak bisa dihapus)\n' "$n" "$ip" ;;
+            *) printf '  %2d. %s\n' "$n" "$ip" ;;
+        esac
+    done < <(wl_current)
+    echo
+}
+wl_add() {
+    local ips=("$@") ip added=() current
+    if [ "${#ips[@]}" -eq 0 ]; then
+        [ -n "$TTY" ] || die "Sebutkan IP: whitelist add <ip> [ip ...]"
+        read -r -a ips <<< "$(ask "IP/subnet yang ditambahkan (pisahkan spasi): " | tr ',' ' ')"
+    fi
+    [ "${#ips[@]}" -gt 0 ] || die "Tidak ada IP yang dimasukkan."
+    current="$(wl_current | tr '\n' ' ')"
+    for ip in "${ips[@]}"; do
+        valid_ip "$ip" || die "IP tidak valid: $ip"
+        case " $current " in
+            *" $ip "*) c_info "$ip sudah ada di whitelist." ;;
+            *) current="$current $ip"; added+=("$ip") ;;
+        esac
+    done
+    [ "${#added[@]}" -gt 0 ] || { wl_list; return 0; }
+    # shellcheck disable=SC2086
+    wl_write $current
+    for ip in "${added[@]}"; do fail2ban-client unban "$ip" >/dev/null 2>&1 || true; c_ok "Ditambahkan: $ip"; done
+    wl_list
+}
+wl_remove() {
+    local ips=("$@") ip keep=() removed=0 cur
+    if [ "${#ips[@]}" -eq 0 ]; then
+        [ -n "$TTY" ] || die "Sebutkan IP: whitelist remove <ip> [ip ...]"
+        wl_list
+        read -r -a ips <<< "$(ask "IP yang dihapus (ketik IP atau nomornya, pisahkan spasi): " | tr ',' ' ')"
+    fi
+    [ "${#ips[@]}" -gt 0 ] || die "Tidak ada IP yang dimasukkan."
+    mapfile -t cur < <(wl_current)
+    # Nomor urut (dari daftar) diubah jadi IP-nya.
+    local resolved=()
+    for ip in "${ips[@]}"; do
+        if [[ "$ip" =~ ^[0-9]+$ ]] && [ "$ip" -ge 1 ] && [ "$ip" -le "${#cur[@]}" ]; then resolved+=("${cur[$((ip - 1))]}"); else resolved+=("$ip"); fi
+    done
+    for ip in "${resolved[@]}"; do
+        case " $WL_BUILTIN " in *" $ip "*) c_warn "$ip adalah bawaan -- tidak dihapus." ;; esac
+        printf '%s\n' "${cur[@]}" | grep -qxF "$ip" || c_warn "$ip tidak ada di whitelist."
+    done
+    for ip in "${cur[@]}"; do
+        local drop=0 r
+        for r in "${resolved[@]}"; do [ "$r" = "$ip" ] && drop=1; done
+        case " $WL_BUILTIN " in *" $ip "*) drop=0 ;; esac
+        if [ "$drop" -eq 1 ]; then removed=$((removed + 1)); c_ok "Dihapus: $ip"; else keep+=("$ip"); fi
+    done
+    [ "$removed" -gt 0 ] || { wl_list; return 0; }
+    wl_write ${keep[@]+"${keep[@]}"}
+    wl_list
+}
+whitelist_cmd() {
+    [ -f "$WL_JAIL" ] || die "Belum terpasang ($WL_JAIL tidak ada). Jalankan dulu: bash gisnet-secure-ssh.sh"
+    have fail2ban-client || die "fail2ban belum terpasang."
+    local action="${1-}"; [ $# -gt 0 ] && shift
+    case "$action" in
+        list|lihat|ls) wl_list ;;
+        add|tambah) wl_add "$@" ;;
+        remove|hapus|rm|del) wl_remove "$@" ;;
+        '')
+            [ -n "$TTY" ] || { wl_list; exit 0; }
+            while :; do
+                wl_list
+                echo "  1) Tambah IP    2) Hapus IP    3) Keluar"
+                case "$(ask "Pilih [1-3]: ")" in
+                    1) wl_add ;;
+                    2) wl_remove ;;
+                    *) break ;;
+                esac
+            done
+            ;;
+        *) die "Perintah whitelist tidak dikenal: $action (pakai: list | add | remove)" ;;
+    esac
+}
+
+if [ "$WL_MODE" -eq 1 ]; then
+    whitelist_cmd ${WL_ARGS[@]+"${WL_ARGS[@]}"}
+    exit 0
+fi
 
 if [ "${#KEYS[@]}" -eq 0 ]; then
     [ -n "$TTY" ] || die "Tidak ada terminal untuk bertanya -- berikan kunci lewat --key \"ssh-ed25519 AAAA...\"."
@@ -189,7 +311,7 @@ install_key() { # install_key <user>
 
 KEY_OK=0
 install_key root && KEY_OK=1
-for u in "${EXTRA_USERS[@]}"; do install_key "$u" || true; done
+for u in ${EXTRA_USERS[@]+"${EXTRA_USERS[@]}"}; do install_key "$u" || true; done
 
 # ------------------------------------------------------------ 2. fail2ban ---
 c_info "Memasang fail2ban..."
