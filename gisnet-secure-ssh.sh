@@ -60,7 +60,7 @@ set -euo pipefail
 # dianggap tidak ada saat perintah datang dari aplikasi (ditemukan 2026-10-29 di server NMS).
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:$PATH}"
 
-SCRIPT_VERSION='2.25'
+SCRIPT_VERSION='2.26'
 SELF_INSTALL=/usr/local/sbin/gisnet-secure-ssh
 STATE_DIR=/etc/gisnet-secure-ssh
 REPORT_CONF="$STATE_DIR/report.conf"
@@ -482,6 +482,7 @@ cmd_install() {
         c_plan "Port SSH: $PORTS$([ -n "$NEW_PORT" ] && echo " (port baru $NEW_PORT, port lama tetap dibuka)")"
         c_plan "Login password SSH: $([ "$PW" = no ] && echo 'DIMATIKAN (kunci saja)' || echo 'tetap aktif')"
         c_plan "Update keamanan otomatis: $([ "$AUTO_UPDATE" -eq 1 ] && echo ya || echo tidak)"
+        c_plan "Sinkron jam (NTP): $(time_sync_active && echo 'sudah aktif' || echo 'diaktifkan (chrony / timesyncd)')"
         c_plan "Jail web: ${WEBLOG:-tidak ($([ -n "$WEB_PROXY" ] && echo "website di belakang $WEB_PROXY" || echo 'nginx/apache tidak ditemukan atau --no-web-jail'))}"
         c_plan "Jail layanan lain: ${SVC_NAMES:-tidak ada (FTP/email tidak ditemukan)}"
         c_plan "Blokir bersama antar-server: $([ "$SHARED" = 1 ] && echo 'ya (IP dari aplikasi, port SSH)' || echo tidak)"
@@ -564,6 +565,7 @@ $blk"; c_ok "Jail layanan $name dipasang."
 
     # --- 4. update keamanan otomatis
     [ "$AUTO_UPDATE" -eq 1 ] && setup_auto_update
+    setup_time_sync
 
     # --- 5. perintah sistem + laporan
     install_self
@@ -670,6 +672,42 @@ setup_auto_update() {
             c_ok "Update keamanan otomatis aktif (yum-cron)." ;;
         *) c_warn "Update otomatis belum didukung untuk $PKG -- dilewati." ;;
     esac
+}
+# 2.26: sinkron jam (NTP). Server cPanel/AlmaLinux (Kulo/Iwak/Eson) ternyata tanpa NTP sama
+# sekali (2026-10-30). Pakai yang sudah ada (chrony / systemd-timesyncd / ntpd), pasang chrony bila
+# tidak ada. Layanan baru dicatat ke baseline supaya tidak muncul sebagai "perubahan mencurigakan".
+time_sync_active() {
+    [ "${HAS_SYSTEMD:-0}" -eq 1 ] || return 1
+    local u; for u in chronyd chrony ntpd ntp ntpsec systemd-timesyncd openntpd; do
+        systemctl is-active --quiet "$u" 2>/dev/null && return 0
+    done
+    return 1
+}
+setup_time_sync() { # setup_time_sync [quiet]
+    [ "${HAS_SYSTEMD:-0}" -eq 1 ] || { [ -n "${1-}" ] || c_warn "Sinkron jam: tanpa systemd, atur manual."; return 0; }
+    if time_sync_active; then [ -n "${1-}" ] || c_info "Sinkron jam (NTP) sudah aktif."; return 0; fi
+    if systemctl cat systemd-timesyncd.service >/dev/null 2>&1; then
+        timedatectl set-ntp true >/dev/null 2>&1 || systemctl enable --now systemd-timesyncd >/dev/null 2>&1 || true
+    fi
+    if ! time_sync_active; then
+        have chronyd || pkg_install chrony >/dev/null 2>&1 || true
+        systemctl enable --now chronyd >/dev/null 2>&1 || systemctl enable --now chrony >/dev/null 2>&1 || true
+    fi
+    if time_sync_active; then
+        [ -f "$BASELINE" ] && baseline_save svc
+        [ -n "${1-}" ] || c_ok "Sinkron jam (NTP) aktif."
+    else
+        [ -n "${1-}" ] || c_warn "Sinkron jam (NTP) gagal diaktifkan -- periksa manual (chrony / timedatectl set-ntp true)."
+    fi
+    return 0
+}
+time_autofix() { # dari laporan (izin update): coba aktifkan NTP paling sering sekali sehari
+    local mark="$STATE_DIR/timesync-tried"
+    [ -n "${PKG-}" ] || detect_os   # dipanggil sebelum report_json (yang biasanya memanggil detect_os)
+    time_sync_active && return 0
+    [ -f "$mark" ] && [ $(( $(date +%s) - $(stat -c %Y "$mark" 2>/dev/null || echo 0) )) -lt 86400 ] && return 0
+    touch "$mark" 2>/dev/null || return 0
+    setup_time_sync quiet
 }
 auto_update_status() {
     if [ -f /etc/apt/apt.conf.d/20auto-upgrades ] && grep -q 'Unattended-Upgrade "1"' /etc/apt/apt.conf.d/20auto-upgrades; then echo "aktif (unattended-upgrades)"
@@ -1609,6 +1647,8 @@ report_send() {
     # shellcheck disable=SC1090
     . "$REPORT_CONF"
     have curl || pkg_install curl >/dev/null 2>&1 || die "curl tidak tersedia."
+    # Jam tidak tersinkron -> aktifkan NTP sendiri (sekali sehari; butuh izin update dari aplikasi).
+    [ -f "$ALLOW_UPDATE" ] && [ "$(id -u)" -eq 0 ] && { time_autofix || true; }
     local out code body resolve=()
     mapfile -t resolve < <(report_resolve_args)
     out="$(report_json | curl -sS -w '\n%{http_code}' --max-time 20 ${resolve[@]+"${resolve[@]}"} -X POST -H 'Content-Type: application/json' -H 'Accept: application/json' -H "Authorization: Bearer $REPORT_TOKEN" --data-binary @- "$REPORT_URL" 2>/dev/null || echo 000)"
