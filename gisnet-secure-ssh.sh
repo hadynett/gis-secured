@@ -40,7 +40,7 @@
 #     report allow-dns on|off                izinkan ganti DNS dari aplikasi (otomatis bila allow-port on)
 #     report allow-key on|off                izinkan tambah/hapus kunci SSH root dari aplikasi (izin terpisah)
 #     report shared-blocklist on|off         blokir bersama: IP penyerang dari server GISNET lain
-#     dns [show|set <ip> [ip] [ip]]          lihat / ganti DNS server (diuji, batal otomatis bila gagal)
+#     dns [show|set <ip> .. (maks 3, 4 bila systemd-resolved)]  lihat / ganti DNS server (diuji, batal otomatis bila gagal)
 #     update [--check] [--force]             perbarui skrip ke versi terbaru, pengaturan tetap
 #     checks                                 pemeriksaan: kesehatan, port terbuka, proses, login SSH (JSON)
 #
@@ -55,7 +55,7 @@ set -euo pipefail
 # dianggap tidak ada saat perintah datang dari aplikasi (ditemukan 2026-10-29 di server NMS).
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:$PATH}"
 
-SCRIPT_VERSION='2.9'
+SCRIPT_VERSION='2.10'
 SELF_INSTALL=/usr/local/sbin/gisnet-secure-ssh
 STATE_DIR=/etc/gisnet-secure-ssh
 REPORT_CONF="$STATE_DIR/report.conf"
@@ -1338,16 +1338,21 @@ dns_test_host() { # nama yang diuji: alamat aplikasi bila laporan aktif
 }
 dns_ok() { timeout 6 getent ahosts "$(dns_test_host)" >/dev/null 2>&1; }
 
-dns_set() { # dns_set <ip> [ip] [ip] -- ganti DNS, uji, kembalikan otomatis bila gagal
-    local mgr ip v4='' v6='' bak con dev old ok=0 when
-    [ $# -ge 1 ] && [ $# -le 3 ] || die "Isi 1 sampai 3 alamat DNS."
+dns_set() { # dns_set <ip> [ip] [ip] [ip] -- ganti DNS, uji, kembalikan otomatis bila gagal
+    local mgr ip v4='' v6='' bak con dev old ok=0 when max=3
+    mgr="$(dns_manager)"; when="$(date '+%Y-%m-%d %H:%M')"
+    # glibc hanya membaca 3 "nameserver" pertama di resolv.conf; systemd-resolved tidak terbatas.
+    [ "$mgr" = systemd-resolved ] && max=4
+    if [ $# -lt 1 ] || [ $# -gt "$max" ]; then
+        [ $# -gt 3 ] && printf '%s gagal: %s alamat DNS -- server ini (%s) hanya memakai 3 pertama, DNS tidak diubah\n' "$when" "$#" "$mgr" > "$DNS_RESULT"
+        die "Isi 1 sampai $max alamat DNS$([ "$max" -eq 3 ] && echo " (Linux hanya membaca 3 nameserver pertama di /etc/resolv.conf; 4 alamat hanya untuk systemd-resolved)")."
+    fi
     for ip in "$@"; do
         case "$ip" in */*) die "DNS harus alamat IP tunggal, bukan subnet: $ip" ;; esac
         valid_ip "$ip" || die "Alamat DNS tidak valid: $ip"
         case "$ip" in *:*) v6="$v6 $ip" ;; *) v4="$v4 $ip" ;; esac
     done
     v4="${v4# }"; v6="${v6# }"
-    mgr="$(dns_manager)"; when="$(date '+%Y-%m-%d %H:%M')"
     bak="$STATE_DIR/dns-backup-$(date +%Y%m%d-%H%M%S)"; mkdir -p "$bak"; chmod 700 "$STATE_DIR" "$bak"
     case "$mgr" in
         networkmanager)
@@ -1405,7 +1410,7 @@ report_apply_dns() { # {"dns_change":{"servers":["ip","ip"]}}
     m="$(printf '%s' "$1" | grep -oE '"dns_change" *: *\{ *"servers" *: *\[[^]]*\] *\}' | head -1 || true)"
     [ -n "$m" ] || return 0
     if ! allows_dns; then c_warn "Aplikasi meminta ganti DNS, tetapi server ini tidak mengizinkan."; return 0; fi
-    list="$(printf '%s' "$m" | sed 's/^[^[]*\[//' | grep -oE '"[0-9A-Fa-f:.]+"' | tr -d '"' | head -3 | paste -sd' ' -)"
+    list="$(printf '%s' "$m" | sed 's/^[^[]*\[//' | grep -oE '"[0-9A-Fa-f:.]+"' | tr -d '"' | head -4 | paste -sd' ' -)"
     [ -n "$list" ] || return 0
     logger -t gisnet-secure-ssh "ganti DNS ke $list diminta dari aplikasi" 2>/dev/null || true
     # Latar belakang: uji + kembalikan otomatis, lalu kirim laporan baru berisi hasilnya.
@@ -1470,7 +1475,7 @@ cmd_dns() {
             [ -f "$DNS_RESULT" ] && echo " Terakhir    : $(cat "$DNS_RESULT")"
             echo ;;
         set|ganti) need_root; shift; dns_set "$@" ;;
-        *) die "Perintah dns tidak dikenal: $1 (show | set <ip> [ip] [ip])" ;;
+        *) die "Perintah dns tidak dikenal: $1 (show | set <ip> [ip] [ip] [ip])" ;;
     esac
 }
 

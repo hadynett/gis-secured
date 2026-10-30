@@ -155,6 +155,8 @@ gisnet-secure-ssh dns                                  # DNS yang dipakai, penga
 gisnet-secure-ssh dns set 8.8.8.8 1.1.1.1 2001:4860:4860::8888
 ```
 
+Maksimal **3 alamat** bila DNS diatur lewat `/etc/resolv.conf` (file biasa atau NetworkManager), karena Linux hanya membaca 3 `nameserver` pertama; di server **systemd-resolved** boleh **4 alamat** (mulai v2.10).
+
 `dns set` menyesuaikan diri dengan pengatur DNS di server (**NetworkManager**, **systemd-resolved**, atau file `/etc/resolv.conf` biasa), lalu menguji apakah alamat aplikasi pemantau masih bisa ditemukan. Bila gagal, **DNS lama dikembalikan otomatis**. DNS juga bisa diganti dari aplikasi (`report allow-dns on`, otomatis aktif bila ganti port sudah diizinkan).
 
 Bila DNS server mati, laporan tetap terkirim lewat IP aplikasi yang terakhir dikenal, dan aplikasi menandai server dengan **DNS bermasalah**.
