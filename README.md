@@ -148,6 +148,19 @@ Skrip otomatis membuka port di **firewalld / ufw**, mendaftarkannya di **SELinux
 
 Bila diizinkan (`gisnet-secure-ssh report allow-port on`), port SSH juga bisa diganti dari aplikasi pemantau dengan dua langkah yang sama: **tambah port baru** (port lama tetap dibuka), lalu **tutup port lama** — tombolnya baru aktif setelah port baru terlihat aktif di laporan dan aplikasi berhasil terhubung ke port itu. Hanya port 22 atau 1024–65535 yang diterima.
 
+### Izinkan semua perintah dari aplikasi (mulai v2.11)
+
+```bash
+# server baru: pasang + laporan + semua izin sekaligus
+bash gisnet-secure-ssh.sh --report-url <url> --report-token <token> --allow-all
+# laporan sudah/baru diatur
+gisnet-secure-ssh report setup <url> <token> --allow-all
+# server yang sudah melapor
+gisnet-secure-ssh report allow-all on      # off = cabut semua izin (laporan tetap jalan)
+```
+
+`--allow-all` menyalakan izin reboot, update skrip, port SSH, whitelist, DNS dan **kunci SSH root**. Pakai hanya bila akun admin di aplikasi pemantau dijaga ketat — pemegangnya bisa menambah kunci root ke server.
+
 ### DNS server (mulai v2.9)
 
 ```bash

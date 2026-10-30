@@ -19,6 +19,7 @@
 #     --no-web-jail          jangan pasang jail pemindai web (nginx/apache)
 #     --report-url <url> --report-token <token>   kirim status ke aplikasi pemantau
 #     --allow-reboot / --no-allow-reboot   izinkan / tolak reboot dari aplikasi (tanpa: ditanya)
+#     --allow-all            izinkan SEMUA perintah dari aplikasi: reboot, update, port, whitelist, DNS, kunci SSH
 #     --no-service-jails     jangan pasang jail FTP/email yang terdeteksi
 #     --no-shared-blocklist  jangan terima blokir bersama dari aplikasi
 #     --dry-run              tampilkan rencana saja
@@ -39,6 +40,7 @@
 #     report allow-whitelist on|off          izinkan ubah whitelist dari aplikasi (otomatis bila allow-port on)
 #     report allow-dns on|off                izinkan ganti DNS dari aplikasi (otomatis bila allow-port on)
 #     report allow-key on|off                izinkan tambah/hapus kunci SSH root dari aplikasi (izin terpisah)
+#     report allow-all on|off                semua izin di atas sekaligus (juga: report setup ... --allow-all)
 #     report shared-blocklist on|off         blokir bersama: IP penyerang dari server GISNET lain
 #     dns [show|set <ip> .. (maks 3, 4 bila systemd-resolved)]  lihat / ganti DNS server (diuji, batal otomatis bila gagal)
 #     update [--check] [--force]             perbarui skrip ke versi terbaru, pengaturan tetap
@@ -55,7 +57,7 @@ set -euo pipefail
 # dianggap tidak ada saat perintah datang dari aplikasi (ditemukan 2026-10-29 di server NMS).
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:$PATH}"
 
-SCRIPT_VERSION='2.10'
+SCRIPT_VERSION='2.11'
 SELF_INSTALL=/usr/local/sbin/gisnet-secure-ssh
 STATE_DIR=/etc/gisnet-secure-ssh
 REPORT_CONF="$STATE_DIR/report.conf"
@@ -356,7 +358,7 @@ wl_current() { [ -f "$JAIL" ] && awk '/^[[:space:]]*ignoreip[[:space:]]*=/{sub(/
 
 # ================================================================ INSTALL ===
 cmd_install() {
-    local KEYS=() WL_INPUT='' WL_GIVEN=0 EXTRA_USERS=() KEEP_PASSWORD=0 NEW_PORT='' AUTO_UPDATE=1 WEB_JAIL=1 SERVICE_JAILS=1 DRY=0 R_URL='' R_TOKEN='' R_REBOOT=ask SHARED=''
+    local KEYS=() WL_INPUT='' WL_GIVEN=0 EXTRA_USERS=() KEEP_PASSWORD=0 NEW_PORT='' AUTO_UPDATE=1 WEB_JAIL=1 SERVICE_JAILS=1 DRY=0 R_URL='' R_TOKEN='' R_REBOOT=ask R_ALL=0 SHARED=''
     # Pemasangan ulang / update: mulai dari pilihan yang tersimpan, opsi di baris perintah tetap menang.
     if [ -f "$INSTALL_CONF" ]; then
         local SAVED_KEEP_PASSWORD=0 SAVED_AUTO_UPDATE=1 SAVED_WEB_JAIL=1 SAVED_SERVICE_JAILS=1 SAVED_EXTRA_USERS=''
@@ -385,6 +387,7 @@ cmd_install() {
             --report-token) R_TOKEN="${2:?}"; shift 2 ;;
             --allow-reboot) R_REBOOT=yes; shift ;;
             --no-allow-reboot) R_REBOOT=no; shift ;;
+            --allow-all) R_ALL=1; R_REBOOT=yes; shift ;;
             --dry-run) DRY=1; shift ;;
             -h|--help) usage ;;
             *) die "Opsi tidak dikenal: $1 (lihat --help)" ;;
@@ -559,7 +562,8 @@ $blk"; c_ok "Jail layanan $name dipasang."
     # --- 5. perintah sistem + laporan
     install_self
     save_install_conf
-    if [ -n "$R_URL" ]; then report_setup "$R_URL" "$R_TOKEN" "$R_REBOOT"
+    [ "$R_ALL" -eq 1 ] && allow_all_set on   # sebelum laporan pertama, supaya aplikasi langsung melihat izinnya
+    if [ -n "$R_URL" ]; then report_setup "$R_URL" "$R_TOKEN" "$R_REBOOT" "$([ "$R_ALL" -eq 1 ] && echo yes || echo ask)"
     elif [ "$R_REBOOT" != ask ]; then allow_reboot_choose "$R_REBOOT"; fi   # berlaku saat laporan nanti diaktifkan
 
     echo
@@ -1479,6 +1483,17 @@ cmd_dns() {
     esac
 }
 
+allow_all_set() { # allow_all_set on|off -- semua izin perintah dari aplikasi sekaligus, tanpa mengirim laporan
+    local f
+    if [ "$1" = on ]; then
+        mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR"
+        for f in "$ALLOW_REBOOT" "$ALLOW_UPDATE" "$ALLOW_PORT" "$ALLOW_WHITELIST" "$ALLOW_DNS" "$ALLOW_KEY"; do touch "$f"; chmod 600 "$f"; done
+        c_ok "SEMUA perintah dari aplikasi diizinkan: reboot, update skrip, port SSH, whitelist, DNS, kunci SSH root."
+    else
+        rm -f "$ALLOW_REBOOT" "$ALLOW_UPDATE" "$ALLOW_PORT" "$ALLOW_WHITELIST" "$ALLOW_DNS" "$ALLOW_KEY"
+        c_ok "Semua perintah dari aplikasi dicabut (laporan status tetap jalan)."
+    fi
+}
 allow_reboot_set() { # allow_reboot_set on|off -- tanpa mengirim laporan
     if [ "$1" = on ]; then
         mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR"; touch "$ALLOW_REBOOT"; chmod 600 "$ALLOW_REBOOT"
@@ -1554,6 +1569,7 @@ cmd_report() {
                     --allow-update) upd=yes ;;
                     --no-allow-update) upd=no ;;
                     --allow-port) mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR"; touch "$ALLOW_PORT"; chmod 600 "$ALLOW_PORT"; c_ok "Ganti port SSH dari aplikasi DIIZINKAN." ;;
+                    --allow-all) allow_all_set on; reboot=yes; upd=yes ;;
                     *) if [ -z "$url" ]; then url="$a"; elif [ -z "$token" ]; then token="$a"; fi ;;
                 esac
             done
@@ -1576,6 +1592,12 @@ cmd_report() {
                 off|tidak) rm -f "$ALLOW_PORT"; c_ok "Ganti port SSH dari aplikasi tidak diizinkan."
                        [ -f "$REPORT_CONF" ] && { report_send quiet || true; } ;;
                 *) echo "Ganti port SSH dari aplikasi: $([ -f "$ALLOW_PORT" ] && echo diizinkan || echo 'tidak diizinkan') (ubah: report allow-port on|off)" ;;
+            esac ;;
+        allow-all|izin-semua)
+            case "${2-}" in
+                on|ya)     allow_all_set on;  [ -f "$REPORT_CONF" ] && { report_send quiet || true; } ;;
+                off|tidak) allow_all_set off; [ -f "$REPORT_CONF" ] && { report_send quiet || true; } ;;
+                *) echo "Pakai: report allow-all on|off (reboot, update, port, whitelist, DNS, kunci SSH sekaligus)" ;;
             esac ;;
         allow-whitelist|allow-dns|allow-key|izin-whitelist|izin-dns|izin-kunci)
             local f what
@@ -1603,7 +1625,7 @@ cmd_report() {
                 off|tidak) mkdir -p "$STATE_DIR"; touch "$SHARED_OFF"; fail2ban-client unban --all >/dev/null 2>&1 || true; c_ok "Blokir bersama dimatikan (IP dari server lain tidak diblokir lagi)." ;;
                 *) echo "Blokir bersama: $([ -f "$SHARED_OFF" ] && echo 'tidak aktif' || echo aktif) (ubah: report shared-blocklist on|off)" ;;
             esac ;;
-        *) die "Perintah report tidak dikenal (now | setup <url> <token> | allow-reboot on|off | allow-update on|off | allow-port on|off | allow-whitelist on|off | allow-dns on|off | allow-key on|off | shared-blocklist on|off | off | json)" ;;
+        *) die "Perintah report tidak dikenal (now | setup <url> <token> | allow-reboot on|off | allow-update on|off | allow-port on|off | allow-whitelist on|off | allow-dns on|off | allow-key on|off | allow-all on|off | shared-blocklist on|off | off | json)" ;;
     esac
 }
 
