@@ -60,7 +60,7 @@ set -euo pipefail
 # dianggap tidak ada saat perintah datang dari aplikasi (ditemukan 2026-10-29 di server NMS).
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:$PATH}"
 
-SCRIPT_VERSION='2.19'
+SCRIPT_VERSION='2.20'
 SELF_INSTALL=/usr/local/sbin/gisnet-secure-ssh
 STATE_DIR=/etc/gisnet-secure-ssh
 REPORT_CONF="$STATE_DIR/report.conf"
@@ -1171,6 +1171,8 @@ snapshot() { # cetak "jenis|item|sidik" -- cron, layanan systemd di /etc, user l
              /var/spool/cron/* /var/spool/cron/crontabs/*; do
         [ -f "$f" ] || continue
         case "$f" in /etc/cron.d/gisnet-secure-ssh|*/.placeholder) continue ;; esac
+        # 2.20: cron bawaan paket pemindai rootkit yang dipasang skrip ini sendiri (Accurate 2026-10-30).
+        case "$f" in */rkhunter|*/chkrootkit) scanner_owned "$f" && continue ;; esac
         echo "cron|$f|$(sha256sum "$f" 2>/dev/null | cut -c1-16)"
     done
     for f in /etc/systemd/system/*.service /etc/systemd/system/*.timer /etc/systemd/system/*.wants/*; do
@@ -1198,6 +1200,12 @@ snapshot() { # cetak "jenis|item|sidik" -- cron, layanan systemd di /etc, user l
         proc = ""; if (match($0, /\(\("[^"]+"/)) proc = substr($0, RSTART + 3, RLENGTH - 4); sub(/ .*/, "", proc)
         if (!seen[port]++) print "port|" port "/tcp|" proc
     }'
+}
+scanner_owned() { # file milik paket rkhunter/chkrootkit (dpkg/rpm)?
+    local o=''
+    if have dpkg-query; then o="$(dpkg-query -S "$1" 2>/dev/null || true)"; o="${o%%:*}"
+    elif have rpm; then o="$(rpm -qf --qf '%{NAME}' "$1" 2>/dev/null || true)"; fi
+    case "$o" in rkhunter|chkrootkit) return 0 ;; *) return 1 ;; esac
 }
 suid_list() { find / -xdev \( -path /proc -o -path /sys -o -path /run -o -path /snap \) -prune -o -type f -perm -4000 -print 2>/dev/null | sort | head -300; }
 cached() { # cached <nama> <detik> <perintah..> -- hasil perintah disimpan, diulang hanya bila sudah basi
@@ -1248,6 +1256,25 @@ time_json() { # {"synced":bool|null,"ntp":bool|null,"offset_ms":angka|null,"sour
 # ada update paket sejak pemindaian lalu -- supaya update sistem tidak jadi peringatan palsu.
 ROOTKIT_RESULT="$STATE_DIR/rootkit.json"
 ROOTKIT_EVERY=604800
+# Naikkan bila daftar pengecualian di rkhunter_conf_local berubah -> semua server memindai ulang sekali.
+ROOTKIT_CONF_VER=1
+RKHUNTER_LOCAL=/etc/rkhunter.conf.local
+rkhunter_conf_local() { # peringatan palsu yang umum (Debian/Ubuntu/RHEL) -- file dikelola skrip ini
+    [ -f "$RKHUNTER_LOCAL" ] && ! grep -q '^# gisnet-secure-ssh' "$RKHUNTER_LOCAL" && return 0  # buatan admin: jangan disentuh
+    local root
+    # rkhunter hanya membaca sshd_config utama (bukan sshd_config.d) -- samakan dengan isinya,
+    # aturan sebenarnya (sshd -T) tetap diperiksa & dilaporkan skrip ini sendiri.
+    root="$(awk 'tolower($1)=="permitrootlogin"{print $2; exit}' /etc/ssh/sshd_config 2>/dev/null || true)"
+    {
+        echo "# gisnet-secure-ssh: dikelola otomatis, jangan diubah (buat file sendiri tanpa baris ini untuk mengambil alih)"
+        echo "ALLOW_SSH_ROOT_USER=${root:-unset}"
+        echo "ALLOWHIDDENFILE=/etc/.updated"
+        echo "ALLOWHIDDENFILE=/usr/share/man/man5/.containerignore.5.gz"
+        echo "ALLOWHIDDENFILE=/usr/share/man/man5/.dockerignore.5.gz"
+        echo "ALLOWHIDDENDIR=/etc/.java"
+        echo "ALLOWHIDDENDIR=/etc/.git"
+    } > "$RKHUNTER_LOCAL.tmp" && mv -f "$RKHUNTER_LOCAL.tmp" "$RKHUNTER_LOCAL"
+}
 rootkit_last_pkg_change() { # epoch perubahan paket terakhir (dpkg/dnf/yum)
     local t=0 f
     for f in /var/log/dpkg.log /var/lib/dpkg/status /var/lib/rpm/rpmdb.sqlite /var/lib/rpm/Packages /var/log/dnf.rpm.log; do
@@ -1260,6 +1287,7 @@ rootkit_scan() { # dijalankan di latar belakang; menulis $ROOTKIT_RESULT
     have rkhunter || pkg_install rkhunter >/dev/null 2>&1 || true
     if have rkhunter; then
         tool=rkhunter
+        rkhunter_conf_local
         if [ ! -f "$stamp" ] || [ "$(rootkit_last_pkg_change)" -gt "$(stat -c %Y "$stamp" 2>/dev/null || echo 0)" ]; then
             rkhunter --propupd --nocolors >/dev/null 2>&1 || true; touch "$stamp"
         fi
@@ -1279,10 +1307,13 @@ rootkit_scan() { # dijalankan di latar belakang; menulis $ROOTKIT_RESULT
     done < <(grep -E 'Warning:|INFECTED|Possible|suspicious|Vulnerable' <<< "$out" || true)
     printf '{"tool":"%s","at":%s,"warnings":%d,"items":[%s]}' "$tool" "$(date +%s)" "$warn" "$items" > "$ROOTKIT_RESULT.tmp"
     mv -f "$ROOTKIT_RESULT.tmp" "$ROOTKIT_RESULT"
+    echo "$ROOTKIT_CONF_VER" > "$STATE_DIR/rootkit-conf"
 }
 rootkit_json() { # hasil terakhir; jalankan pemindaian baru di latar belakang bila sudah > 7 hari
     local age=999999999
     [ -f "$ROOTKIT_RESULT" ] && age=$(( $(date +%s) - $(stat -c %Y "$ROOTKIT_RESULT" 2>/dev/null || echo 0) ))
+    # Pengecualian peringatan palsu berubah sejak pemindaian terakhir -> pindai ulang sekarang.
+    [ "$(cat "$STATE_DIR/rootkit-conf" 2>/dev/null || true)" = "$ROOTKIT_CONF_VER" ] || age=999999999
     if [ "$age" -ge "$ROOTKIT_EVERY" ] && [ -w "$STATE_DIR" ] && [ "$(id -u)" -eq 0 ] && [ -f "$SELF_INSTALL" ] \
        && ! pgrep -f "gisnet-secure-ssh rootkit-scan" >/dev/null 2>&1; then
         ( GISNET_NONINTERACTIVE=1 nohup nice -n 15 "$SELF_INSTALL" rootkit-scan </dev/null >/dev/null 2>&1 & ) 2>/dev/null || true

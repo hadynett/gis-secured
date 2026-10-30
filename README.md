@@ -174,6 +174,8 @@ Mulai v2.16 juga dipantau: **program SUID** baru dan **port** yang baru menerima
 
 Mulai v2.18 juga dilaporkan **jam server** (tersinkron NTP atau tidak, dan selisihnya; dibaca dari chrony / systemd-timesyncd / ntpd) serta hasil **pemindaian rootkit mingguan**. Pemindaian memakai `rkhunter` (dipasang otomatis bila belum ada; cadangan `chkrootkit`), berjalan di latar belakang dengan prioritas rendah sekali seminggu, dan basis data file-nya hanya diperbarui bila ada paket yang berubah. Jalankan manual: `gisnet-secure-ssh rootkit-scan`. rkhunter kadang memberi peringatan palsu -- periksa `/var/log/rkhunter.log`.
 
+Mulai v2.20 peringatan palsu rkhunter yang umum (`/etc/.updated`, man page `.containerignore`, `PermitRootLogin` yang hanya diatur di `sshd_config.d`) dikecualikan lewat `/etc/rkhunter.conf.local` (dikelola skrip; file buatan admin tidak disentuh), dan file cron milik paket rkhunter/chkrootkit tidak dihitung sebagai perubahan mencurigakan.
+
 ### Batasi port berbahaya (mulai v2.15)
 
 ```bash
