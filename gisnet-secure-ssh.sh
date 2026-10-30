@@ -59,7 +59,7 @@ set -euo pipefail
 # dianggap tidak ada saat perintah datang dari aplikasi (ditemukan 2026-10-29 di server NMS).
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:$PATH}"
 
-SCRIPT_VERSION='2.16'
+SCRIPT_VERSION='2.17'
 SELF_INSTALL=/usr/local/sbin/gisnet-secure-ssh
 STATE_DIR=/etc/gisnet-secure-ssh
 REPORT_CONF="$STATE_DIR/report.conf"
@@ -1143,12 +1143,12 @@ checks_fields() { # potongan JSON (tanpa kurung kurawal) -- dipakai laporan & pe
     logins="$(checks_logins)"
     web="$(cat "$WEB_PROXY_STATE" 2>/dev/null || true)"
     jails="$( { fail2ban-client status 2>/dev/null | sed -n 's/.*Jail list:[[:space:]]*//p' | tr -d ' ' | tr ',' '\n' | grep -vxE 'sshd|recidive|gisnet-scan|gisnet-shared|' || true; } | awk '{printf "%s\"%s\"", (NR>1?",":""), $0}')"
-    printf '"health":%s,"open_ports":%s,"suspicious":%s,"logins":%s,"logins_7d":%s,"web_proxy":%s,"service_jails":[%s],"changes":%s,"baseline_at":%s,"restricted_ports":[%s],"web_leaks":%s,"certs":%s' \
+    printf '"health":%s,"open_ports":%s,"suspicious":%s,"logins":%s,"logins_7d":%s,"web_proxy":%s,"service_jails":[%s],"changes":%s,"baseline_at":%s,"restricted_ports":[%s],"web_leaks":%s,"certs":%s,%s' \
         "$(checks_health)" "$(checks_ports)" "$(checks_processes)" "${logins%|*}" "${logins##*|}" \
         "$([ -n "$web" ] && json_str "$web" || echo null)" "$jails" \
         "$(changes_json)" "$(sed -n 's/^# baseline //p' "$BASELINE" 2>/dev/null | head -1 | grep -E '^[0-9]+$' || echo null)" \
         "$(restricted_ports | paste -sd, -)" \
-        "$(web_leaks_json)" "$(certs_json)"
+        "$(web_leaks_json)" "$(certs_json)" "$(ssh_fail_fields)"
 }
 cmd_checks() { # cetak hasil pemeriksaan sebagai JSON (dipakai skrip status VM aplikasi)
     detect_os
@@ -1200,6 +1200,23 @@ cached() { # cached <nama> <detik> <perintah..> -- hasil perintah disimpan, diul
     local name="$1" ttl="$2" f; shift 2; f="$STATE_DIR/cache-$name"
     if [ -f "$f" ] && [ $(( $(date +%s) - $(stat -c %Y "$f" 2>/dev/null || echo 0) )) -lt "$ttl" ]; then cat "$f"; return 0; fi
     if [ -w "$STATE_DIR" ]; then "$@" > "$f.tmp" 2>/dev/null; mv -f "$f.tmp" "$f"; cat "$f"; else "$@" 2>/dev/null; fi
+}
+
+# ===================================== LONJAKAN LOGIN GAGAL (2.17) ===
+# Percobaan login SSH gagal per jam & per 24 jam + IP terbanyak -- aplikasi menandai lonjakan
+# mendadak (serangan terarah) walaupun fail2ban sudah memblokir.
+SSH_FAIL_RE='Invalid user|Failed (password|publickey|keyboard-interactive)|authenticating user .*\[preauth\]|maximum authentication attempts|Did not receive identification|Unable to negotiate'
+ssh_fail_lines() { # ssh_fail_lines <sejak> -- baris log sshd yang gagal (tanpa pipa ke grep -q: lihat catatan pipefail)
+    have journalctl && [ "${HAS_SYSTEMD:-0}" -eq 1 ] || return 0
+    journalctl -q --no-pager -o cat -u ssh -u sshd --since "$1" 2>/dev/null | grep -E "$SSH_FAIL_RE" || true
+}
+ssh_fail_fields() { # potongan JSON: "ssh_fail_1h":N,"ssh_fail_24h":N,"ssh_fail_top":[{"ip","count"}]
+    local h1 h24 top
+    h1="$(ssh_fail_lines '-1h')"
+    h24="$(cached sshfail24 1800 ssh_fail_lines '-24h' | wc -l)"
+    top="$(awk '{ for (i = 2; i <= NF; i++) if ($i == "port" && $(i-1) ~ /^[0-9a-fA-F.:]+$/ && $(i-1) ~ /[.:]/) { print $(i-1); break } }' <<< "$h1" \
+        | sort | uniq -c | sort -rn | head -3 | awk '{printf "%s{\"ip\":\"%s\",\"count\":%d}", (NR>1?",":""), $2, $1}')"
+    printf '"ssh_fail_1h":%d,"ssh_fail_24h":%d,"ssh_fail_top":[%s]' "$(grep -c . <<< "$h1" || true)" "${h24:-0}" "$top"
 }
 
 # ============================================ WEBSITE & SERTIFIKAT (2.16) ===
@@ -1256,20 +1273,32 @@ certs_json() {
 }
 baseline_save() { # baseline_save [jenis] -- tanpa jenis: semuanya; dengan jenis: ganti bagian itu saja
     [ -w "$STATE_DIR" ] || { mkdir -p "$STATE_DIR" 2>/dev/null && chmod 700 "$STATE_DIR"; } || return 0
-    local now tmp; now="$(snapshot | sort -u)"; tmp="$BASELINE.tmp"
-    if [ -n "${1-}" ] && [ -f "$BASELINE" ]; then
-        { grep -v "^$1|" "$BASELINE" | grep -v '^#' || true; grep "^$1|" <<< "$now" || true; } | sort -u > "$tmp"
-    else
-        printf '%s\n' "$now" > "$tmp"
-    fi
-    { echo "# baseline $(date +%s)"; cat "$tmp"; } > "$BASELINE"; rm -f "$tmp"; chmod 600 "$BASELINE"
+    # Laporan cron & laporan sesudah update bisa berjalan bersamaan (OMNI 2026-10-30): dulu file
+    # dikosongkan lalu ditulis ulang, proses lain membaca file kosong -> baseline hilang. Sekarang
+    # dikunci (flock) dan ditulis ke file sementara unik lalu ditukar sekaligus (mv atomik).
+    (
+        have flock && { exec 9>"$STATE_DIR/baseline.lock"; flock -w 60 9 || true; }
+        local now tmp
+        now="$(snapshot | sort -u)"
+        tmp="$(mktemp "$STATE_DIR/baseline.XXXXXX")"
+        {
+            echo "# baseline $(date +%s)"
+            if [ -n "${1-}" ] && [ -f "$BASELINE" ]; then
+                { grep -v "^$1|" "$BASELINE" | grep -v '^#' || true; grep "^$1|" <<< "$now" || true; } | sort -u
+            else
+                printf '%s\n' "$now"
+            fi
+        } > "$tmp"
+        chmod 600 "$tmp"; mv -f "$tmp" "$BASELINE"
+    )
 }
 changes_json() { # JSON array perubahan sejak baseline + temuan langsung (program di /tmp, koneksi penambang)
     local now base out='' n=0 typ item sig old p f rest
     if [ ! -f "$BASELINE" ]; then baseline_save; printf '[]'; return 0; fi
-    # Jenis yang baru dipantau versi ini (baseline dari versi lama belum memuatnya): catat
-    # diam-diam sebagai normal, jangan dilaporkan sebagai "baru" semuanya.
-    for typ in suid port; do grep -q "^$typ|" "$BASELINE" || baseline_save "$typ"; done
+    # Jenis yang belum ada sama sekali di baseline -- jenis baru dari versi ini, atau bagian yang
+    # hilang karena balapan tulis di v2.16 (OMNI 2026-10-30) -- dicatat diam-diam sebagai normal,
+    # bukan dilaporkan "baru" semuanya. Server normal selalu punya /etc/crontab & user root.
+    for typ in cron svc user key suid port; do grep -q "^$typ|" "$BASELINE" || baseline_save "$typ"; done
     now="$(snapshot | sort -u)"; base="$(grep -v '^#' "$BASELINE" || true)"
     while IFS='|' read -r typ item sig; do
         [ -n "$typ" ] || continue
