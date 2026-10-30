@@ -60,7 +60,7 @@ set -euo pipefail
 # dianggap tidak ada saat perintah datang dari aplikasi (ditemukan 2026-10-29 di server NMS).
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:$PATH}"
 
-SCRIPT_VERSION='2.26'
+SCRIPT_VERSION='2.27'
 SELF_INSTALL=/usr/local/sbin/gisnet-secure-ssh
 STATE_DIR=/etc/gisnet-secure-ssh
 REPORT_CONF="$STATE_DIR/report.conf"
@@ -1232,10 +1232,14 @@ snapshot() { # cetak "jenis|item|sidik" -- cron, layanan systemd di /etc, user l
     # 2.16: program SUID (cara penyusup kembali jadi root) -- dicari paling sering sekali sejam.
     cached suid 3600 suid_list | while IFS= read -r f; do [ -n "$f" ] && echo "suid|$f|$(sha256sum "$f" 2>/dev/null | cut -c1-16)"; done
     # 2.16: port yang menerima koneksi dari internet -- layanan baru yang tiba-tiba terbuka.
-    ss -H -tlnp 2>/dev/null | awk '{
+    # 2.27: di server cPanel, port milik daemon cPanel sendiri dilewati -- cPanel sering menutup-buka
+    # port-nya (Eson 80/443, Iwak 2082-2096), jadi selalu muncul lagi sebagai "baru".
+    local skip_proc='-'; [ -d /usr/local/cpanel ] && skip_proc='cpsrvd cpdavd cphulkd cpanellogd'
+    ss -H -tlnp 2>/dev/null | awk -v skip=" $skip_proc " '{
         local = $4; port = local; sub(/.*:/, "", port); addr = local; sub(/:[0-9]+$/, "", addr); gsub(/[\[\]]/, "", addr); sub(/%.*/, "", addr)
         if (addr ~ /^127\./ || addr == "::1" || addr ~ /^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|169\.254\.|fe80|fd|fc)/) next
         proc = ""; if (match($0, /\(\("[^"]+"/)) proc = substr($0, RSTART + 3, RLENGTH - 4); sub(/ .*/, "", proc)
+        if (index(skip, " " proc " ")) next
         if (!seen[port]++) print "port|" port "/tcp|" proc
     }'
 }
@@ -1367,9 +1371,13 @@ rootkit_scan() { # dijalankan di latar belakang; menulis $ROOTKIT_RESULT
 rootkit_json() { # hasil terakhir; jalankan pemindaian baru di latar belakang bila sudah > 7 hari
     local age=999999999
     [ -f "$ROOTKIT_RESULT" ] && age=$(( $(date +%s) - $(stat -c %Y "$ROOTKIT_RESULT" 2>/dev/null || echo 0) ))
+    # 2.27: ada temuan -> periksa ulang tiap hari (temuan yang sudah tidak berlaku, mis. user 'chrony'
+    # baru, hilang besoknya; temuan sungguhan tetap diperiksa lebih sering). Bersih -> seminggu sekali.
+    local every="$ROOTKIT_EVERY"
+    [ -f "$ROOTKIT_RESULT" ] && ! grep -q '"warnings":0' "$ROOTKIT_RESULT" && every=86400
     # Pengecualian peringatan palsu berubah sejak pemindaian terakhir -> pindai ulang sekarang.
     [ "$(cat "$STATE_DIR/rootkit-conf" 2>/dev/null || true)" = "$ROOTKIT_CONF_VER" ] || age=999999999
-    if [ "$age" -ge "$ROOTKIT_EVERY" ] && [ -w "$STATE_DIR" ] && [ "$(id -u)" -eq 0 ] && [ -f "$SELF_INSTALL" ] \
+    if [ "$age" -ge "$every" ] && [ -w "$STATE_DIR" ] && [ "$(id -u)" -eq 0 ] && [ -f "$SELF_INSTALL" ] \
        && ! pgrep -f "gisnet-secure-ssh rootkit-scan" >/dev/null 2>&1; then
         ( GISNET_NONINTERACTIVE=1 nohup nice -n 15 "$SELF_INSTALL" rootkit-scan </dev/null >/dev/null 2>&1 & ) 2>/dev/null || true
     fi
