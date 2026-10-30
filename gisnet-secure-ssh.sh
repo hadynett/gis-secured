@@ -57,7 +57,7 @@ set -euo pipefail
 # dianggap tidak ada saat perintah datang dari aplikasi (ditemukan 2026-10-29 di server NMS).
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:$PATH}"
 
-SCRIPT_VERSION='2.11'
+SCRIPT_VERSION='2.12'
 SELF_INSTALL=/usr/local/sbin/gisnet-secure-ssh
 STATE_DIR=/etc/gisnet-secure-ssh
 REPORT_CONF="$STATE_DIR/report.conf"
@@ -933,7 +933,10 @@ cmd_port() {
     apply_ssh "${pw:-no}" "$newports"
     if [ -f "$JAIL" ]; then
         backup "$JAIL"
-        awk -v v="$newports" '/^\[/{s=$0} (s=="[sshd]"||s=="[recidive]"||s=="[gisnet-shared]") && /^[[:space:]]*port[[:space:]]*=/{print "port      = " v; next} {print}' "$JAIL" > "$JAIL.tmp" && cat "$JAIL.tmp" > "$JAIL" && rm -f "$JAIL.tmp"
+        # Tulis "port = <baru>" tepat di bawah judul jail SSH dan buang baris port lamanya --
+        # juga bila jail itu belum punya baris port (jail buatan tangan: default "ssh" = 22,
+        # ditemukan di VM-1/VM-2 2026-10-30; tanpa ini port baru tidak dilindungi fail2ban).
+        awk -v v="$newports" '/^\[/{s=$0; print; if (s=="[sshd]"||s=="[recidive]"||s=="[gisnet-shared]") print "port      = " v; next} (s=="[sshd]"||s=="[recidive]"||s=="[gisnet-shared]") && /^[[:space:]]*port[[:space:]]*=/{next} {print}' "$JAIL" > "$JAIL.tmp" && cat "$JAIL.tmp" > "$JAIL" && rm -f "$JAIL.tmp"
         f2b_reload || true
     fi
     if [ "$remove_old" -eq 1 ]; then c_ok "SSH sekarang hanya di port $p."
