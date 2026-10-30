@@ -57,7 +57,7 @@ set -euo pipefail
 # dianggap tidak ada saat perintah datang dari aplikasi (ditemukan 2026-10-29 di server NMS).
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:$PATH}"
 
-SCRIPT_VERSION='2.13'
+SCRIPT_VERSION='2.14'
 SELF_INSTALL=/usr/local/sbin/gisnet-secure-ssh
 STATE_DIR=/etc/gisnet-secure-ssh
 REPORT_CONF="$STATE_DIR/report.conf"
@@ -1024,14 +1024,19 @@ fw_port_state() { # fw_port_state <port>
         else echo open; fi
         return 0
     fi
-    if have nft && nft list ruleset >/dev/null 2>&1 && nft list ruleset 2>/dev/null | grep -q 'hook input'; then
+    # Ruleset dibaca SEKALI ke variabel lalu dicek tanpa pipa: "nft list ruleset | grep -q" di
+    # server dengan ruleset besar (cPanel + set fail2ban, Kulo 2026-10-30) membuat nft kena SIGPIPE,
+    # dan dengan pipefail pemeriksaannya dianggap gagal -> blok ini dilewati, hasil salah "open".
+    local rules=''
+    have nft && rules="$(nft list ruleset 2>/dev/null || true)"
+    if [ -n "$rules" ] && grep -q 'hook input' <<< "$rules"; then
         # Baris untuk loopback (iifname "lo") hanya lalu lintas server sendiri -- tidak dihitung.
-        lines="$(nft list ruleset 2>/dev/null | grep -E "dport (\{[^}]*[ ,]$p[ ,}][^}]*\}|\{ ?$p ?\}|$p\b)" | grep -v 'iifname "lo"' || true)"
+        lines="$(grep -E "dport (\{[^}]*[ ,]$p[ ,}][^}]*\}|\{ ?$p ?\}|$p\b)" <<< "$rules" | grep -v 'iifname "lo"' || true)"
         # drop/reject untuk semua sumber berlaku di base chain mana pun (mis. tabel sendiri
         # "gisnet_mysql" di Kulo, 2026-10-30) -- accept di tabel lain tidak bisa membatalkannya.
-        if printf '%s\n' "$lines" | grep -E '\b(drop|reject)\b' | grep -qv 'saddr'; then
+        if grep -E '\b(drop|reject)\b' <<< "$lines" | grep -qv 'saddr'; then
             echo blocked
-        elif nft list ruleset 2>/dev/null | grep -q 'hook input.*policy drop'; then
+        elif grep -q 'hook input.*policy drop' <<< "$rules"; then
             if printf '%s\n' "$lines" | grep 'accept' | grep -qv 'saddr'; then echo open
             elif printf '%s\n' "$lines" | grep -q 'accept'; then echo restricted
             else echo blocked; fi
@@ -1041,14 +1046,16 @@ fw_port_state() { # fw_port_state <port>
         fi
         return 0
     fi
-    if have iptables && iptables -S INPUT >/dev/null 2>&1; then
-        lines="$(iptables -S INPUT 2>/dev/null | grep -E -- "--dports? ([0-9,:]*,)?$p(,|\b)" || true)"
-        if iptables -S INPUT 2>/dev/null | grep -q '^-P INPUT DROP'; then
-            if printf '%s\n' "$lines" | grep 'ACCEPT' | grep -qv -- '-s '; then echo open
-            elif printf '%s\n' "$lines" | grep -q 'ACCEPT'; then echo restricted
+    local ipt=''
+    have iptables && ipt="$(iptables -S INPUT 2>/dev/null || true)"   # sekali, tanpa pipa (lihat catatan nft)
+    if [ -n "$ipt" ]; then
+        lines="$(grep -E -- "--dports? ([0-9,:]*,)?$p(,|\b)" <<< "$ipt" || true)"
+        if grep -q '^-P INPUT DROP' <<< "$ipt"; then
+            if grep 'ACCEPT' <<< "$lines" | grep -qv -- '-s '; then echo open
+            elif grep -q 'ACCEPT' <<< "$lines"; then echo restricted
             else echo blocked; fi
         else
-            printf '%s\n' "$lines" | grep -E 'DROP|REJECT' | grep -qv -- '-s ' && echo blocked || echo open
+            grep -E 'DROP|REJECT' <<< "$lines" | grep -qv -- '-s ' && echo blocked || echo open
         fi
         return 0
     fi
