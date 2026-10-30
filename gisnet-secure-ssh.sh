@@ -60,7 +60,7 @@ set -euo pipefail
 # dianggap tidak ada saat perintah datang dari aplikasi (ditemukan 2026-10-29 di server NMS).
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:$PATH}"
 
-SCRIPT_VERSION='2.23'
+SCRIPT_VERSION='2.24'
 SELF_INSTALL=/usr/local/sbin/gisnet-secure-ssh
 STATE_DIR=/etc/gisnet-secure-ssh
 REPORT_CONF="$STATE_DIR/report.conf"
@@ -1258,7 +1258,7 @@ time_json() { # {"synced":bool|null,"ntp":bool|null,"offset_ms":angka|null,"sour
 ROOTKIT_RESULT="$STATE_DIR/rootkit.json"
 ROOTKIT_EVERY=604800
 # Naikkan bila daftar pengecualian di rkhunter_conf_local berubah -> semua server memindai ulang sekali.
-ROOTKIT_CONF_VER=2
+ROOTKIT_CONF_VER=3
 RKHUNTER_LOCAL=/etc/rkhunter.conf.local
 rkhunter_conf_local() { # peringatan palsu yang umum (Debian/Ubuntu/RHEL) -- file dikelola skrip ini
     [ -f "$RKHUNTER_LOCAL" ] && ! grep -q '^# gisnet-secure-ssh' "$RKHUNTER_LOCAL" && return 0  # buatan admin: jangan disentuh
@@ -1274,8 +1274,12 @@ rkhunter_conf_local() { # peringatan palsu yang umum (Debian/Ubuntu/RHEL) -- fil
         echo "ALLOWHIDDENFILE=/usr/share/man/man5/.dockerignore.5.gz"
         echo "ALLOWHIDDENDIR=/etc/.java"
         echo "ALLOWHIDDENDIR=/etc/.git"
+        # Program bawaan distro yang memang berupa skrip (Debian: libwww-perl; AlmaLinux 10: grep).
+        local f; for f in /usr/bin/lwp-request /usr/bin/egrep /usr/bin/fgrep /bin/egrep /bin/fgrep; do
+            if [ -f "$f" ] && [ ! -L "$f" ]; then echo "SCRIPTWHITELIST=$f"; fi
+        done
         # cPanel mengganti banyak file milik paket sistem -> verifikasi paket selalu "gagal" (Kulo/Iwak/Eson).
-        [ -d /usr/local/cpanel ] && echo "PKGMGR=NONE"
+        if [ -d /usr/local/cpanel ]; then echo "PKGMGR=NONE"; fi  # bukan `[ ] && echo`: gagal di server non-cPanel (2.21)
     } > "$RKHUNTER_LOCAL.tmp" && mv -f "$RKHUNTER_LOCAL.tmp" "$RKHUNTER_LOCAL"
 }
 rootkit_last_pkg_change() { # epoch perubahan paket terakhir (dpkg/dnf/yum)
@@ -1291,10 +1295,12 @@ rootkit_scan() { # dijalankan di latar belakang; menulis $ROOTKIT_RESULT
     have rkhunter || APT_NO_RECOMMENDS=1 pkg_install rkhunter >/dev/null 2>&1 || true
     if have rkhunter; then
         tool=rkhunter
-        rkhunter_conf_local
+        rkhunter_conf_local || true
         # Paket EPEL (AlmaLinux/RHEL) tidak membawa daftar port backdoor -- unduh sekali.
         [ -s /var/lib/rkhunter/db/backdoorports.dat ] || rkhunter --update --nocolors >/dev/null 2>&1 || true
-        if [ ! -f "$stamp" ] || [ "$(rootkit_last_pkg_change)" -gt "$(stat -c %Y "$stamp" 2>/dev/null || echo 0)" ]; then
+        # Sidik jari ulang juga bila pengecualian berubah (mis. "No hash value found" untuk file yang
+        # terpasang setelah --propupd pertama, Kulo/Iwak/Eson 2026-10-30).
+        if [ ! -f "$stamp" ] || [ "$(rootkit_last_pkg_change)" -gt "$(stat -c %Y "$stamp" 2>/dev/null || echo 0)" ]            || [ "$(cat "$STATE_DIR/rootkit-conf" 2>/dev/null || true)" != "$ROOTKIT_CONF_VER" ]; then
             rkhunter --propupd --nocolors >/dev/null 2>&1 || true; touch "$stamp"
         fi
         out="$(rkhunter --check --sk --nocolors --rwo 2>/dev/null || true)"
