@@ -60,7 +60,7 @@ set -euo pipefail
 # dianggap tidak ada saat perintah datang dari aplikasi (ditemukan 2026-10-29 di server NMS).
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:$PATH}"
 
-SCRIPT_VERSION='2.18'
+SCRIPT_VERSION='2.19'
 SELF_INSTALL=/usr/local/sbin/gisnet-secure-ssh
 STATE_DIR=/etc/gisnet-secure-ssh
 REPORT_CONF="$STATE_DIR/report.conf"
@@ -133,7 +133,10 @@ detect_os() {
 }
 pkg_install() {
     case "$PKG" in
-        apt)    DEBIAN_FRONTEND=noninteractive apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$@" ;;
+        # Repo pihak ketiga yang rusak (kunci kedaluwarsa, rilis dihapus) membuat `apt-get update`
+        # gagal walau repo distro sehat -> tetap lanjut memasang dari daftar paket yang ada.
+        apt)    DEBIAN_FRONTEND=noninteractive apt-get update -qq || c_warn "apt-get update bermasalah (ada repo pihak ketiga rusak) -- tetap mencoba memasang $*."
+                DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$@" ;;
         dnf)    dnf install -y -q "$@" ;;
         yum)    yum install -y -q "$@" ;;
         zypper) zypper --non-interactive install -y "$@" ;;
