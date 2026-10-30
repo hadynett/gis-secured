@@ -161,6 +161,25 @@ gisnet-secure-ssh report allow-all on      # off = cabut semua izin (laporan tet
 
 `--allow-all` menyalakan izin reboot, update skrip, port SSH, whitelist, DNS dan **kunci SSH root**. Pakai hanya bila akun admin di aplikasi pemantau dijaga ketat — pemegangnya bisa menambah kunci root ke server.
 
+### Jejak penyusup (mulai v2.15)
+
+```bash
+gisnet-secure-ssh baseline          # perubahan sejak kondisi normal
+gisnet-secure-ssh baseline accept   # semua yang tampil memang wajar -> catat kondisi sekarang
+```
+
+Saat pertama dijalankan, skrip mencatat kondisi normal: jadwal **cron**, **layanan systemd** di `/etc`, **user** yang bisa login / ber-UID 0, dan **kunci SSH**. Setiap laporan berikutnya menyebut apa yang **baru atau berubah**, ditambah program yang bisa dijalankan di `/tmp`, `/var/tmp`, `/dev/shm` dan koneksi keluar ke port khas kolam penambang kripto. Kunci yang ditambah/dihapus lewat `key` atau aplikasi otomatis dianggap wajar.
+
+### Batasi port berbahaya (mulai v2.15)
+
+```bash
+gisnet-secure-ssh restrict add 3306      # MySQL hanya dari server ini sendiri
+gisnet-secure-ssh restrict remove 3306
+gisnet-secure-ssh restrict list
+```
+
+Membuat tabel nftables tersendiri (`gisnet_restrict`) yang hanya mengizinkan loopback dan IP server itu sendiri, plus layanan `gisnet-restrict.service` supaya tetap berlaku setelah reboot. Port SSH tidak bisa dibatasi. Dari aplikasi pemantau: tombol **Batasi ke server ini** (butuh `report allow-port on`).
+
 ### DNS server (mulai v2.9)
 
 ```bash

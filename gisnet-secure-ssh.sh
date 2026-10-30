@@ -43,6 +43,8 @@
 #     report allow-all on|off                semua izin di atas sekaligus (juga: report setup ... --allow-all)
 #     report shared-blocklist on|off         blokir bersama: IP penyerang dari server GISNET lain
 #     dns [show|set <ip> .. (maks 3, 4 bila systemd-resolved)]  lihat / ganti DNS server (diuji, batal otomatis bila gagal)
+#     baseline [show|accept]                 jejak penyusup: perubahan cron/layanan/user/kunci sejak kondisi normal
+#     restrict [list|add <port>|remove <port>]   batasi port berbahaya (mis. 3306) ke server ini sendiri
 #     update [--check] [--force]             perbarui skrip ke versi terbaru, pengaturan tetap
 #     checks                                 pemeriksaan: kesehatan, port terbuka, proses, login SSH (JSON)
 #
@@ -57,7 +59,7 @@ set -euo pipefail
 # dianggap tidak ada saat perintah datang dari aplikasi (ditemukan 2026-10-29 di server NMS).
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:$PATH}"
 
-SCRIPT_VERSION='2.14'
+SCRIPT_VERSION='2.15'
 SELF_INSTALL=/usr/local/sbin/gisnet-secure-ssh
 STATE_DIR=/etc/gisnet-secure-ssh
 REPORT_CONF="$STATE_DIR/report.conf"
@@ -867,6 +869,7 @@ key_add() { # key_add <user> [kunci]
     [ -n "$key" ] || { [ -n "$TTY" ] || die "Sebutkan kunci: key add \"ssh-ed25519 AAAA... nama\""; key="$(ask "Tempel kunci publik: " | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"; }
     valid_key "$key" || die "Kunci publik tidak valid (pastikan isi file .pub)."
     start_backup; install_keys "$user" "$key" >/dev/null && c_ok "Kunci ${key##* } dipasang untuk $user."
+    [ -f "$BASELINE" ] && baseline_save key   # perubahan disengaja -- bukan "jejak penyusup"
     key_list "$user"
 }
 key_remove() { # key_remove <user> [nomor|nama]
@@ -889,6 +892,7 @@ key_remove() { # key_remove <user> [nomor|nama]
     [ -n "$removed" ] || { rm -f "$file.tmp"; die "Kunci '$sel' tidak ditemukan."; }
     cat "$file.tmp" > "$file"; rm -f "$file.tmp"
     c_ok "Kunci '$removed' dihapus dari $user (cadangan: $BACKUP_DIR)."
+    [ -f "$BASELINE" ] && baseline_save key   # perubahan disengaja -- bukan "jejak penyusup"
     key_list "$user"
 }
 cmd_key() {
@@ -1139,13 +1143,171 @@ checks_fields() { # potongan JSON (tanpa kurung kurawal) -- dipakai laporan & pe
     logins="$(checks_logins)"
     web="$(cat "$WEB_PROXY_STATE" 2>/dev/null || true)"
     jails="$( { fail2ban-client status 2>/dev/null | sed -n 's/.*Jail list:[[:space:]]*//p' | tr -d ' ' | tr ',' '\n' | grep -vxE 'sshd|recidive|gisnet-scan|gisnet-shared|' || true; } | awk '{printf "%s\"%s\"", (NR>1?",":""), $0}')"
-    printf '"health":%s,"open_ports":%s,"suspicious":%s,"logins":%s,"logins_7d":%s,"web_proxy":%s,"service_jails":[%s]' \
+    printf '"health":%s,"open_ports":%s,"suspicious":%s,"logins":%s,"logins_7d":%s,"web_proxy":%s,"service_jails":[%s],"changes":%s,"baseline_at":%s,"restricted_ports":[%s]' \
         "$(checks_health)" "$(checks_ports)" "$(checks_processes)" "${logins%|*}" "${logins##*|}" \
-        "$([ -n "$web" ] && json_str "$web" || echo null)" "$jails"
+        "$([ -n "$web" ] && json_str "$web" || echo null)" "$jails" \
+        "$(changes_json)" "$(sed -n 's/^# baseline //p' "$BASELINE" 2>/dev/null | head -1 | grep -E '^[0-9]+$' || echo null)" \
+        "$(restricted_ports | paste -sd, -)"
 }
 cmd_checks() { # cetak hasil pemeriksaan sebagai JSON (dipakai skrip status VM aplikasi)
     detect_os
     printf '{%s}\n' "$(checks_fields)"
+}
+
+# ================================================= JEJAK PENYUSUP (2.15) ===
+# Belajar dari kasus xmrig (ACS1, 2026-10-26): penyusup meninggalkan cron/layanan/user/kunci
+# baru. Kondisi normal dicatat sekali (baseline), lalu setiap laporan membandingkannya.
+# File milik skrip ini sendiri tidak dihitung, supaya update/pasang ulang tidak memicu peringatan.
+BASELINE="$STATE_DIR/baseline.txt"
+MINER_PORTS='3333 4444 5555 6666 7777 8888 9999 14433 14444 45560 45700'
+snapshot() { # cetak "jenis|item|sidik" -- cron, layanan systemd di /etc, user login/UID 0, kunci SSH
+    local f u uid home shell line fp
+    for f in /etc/crontab /etc/cron.d/* /etc/cron.hourly/* /etc/cron.daily/* /etc/cron.weekly/* /etc/cron.monthly/* \
+             /var/spool/cron/* /var/spool/cron/crontabs/*; do
+        [ -f "$f" ] || continue
+        case "$f" in /etc/cron.d/gisnet-secure-ssh|*/.placeholder) continue ;; esac
+        echo "cron|$f|$(sha256sum "$f" 2>/dev/null | cut -c1-16)"
+    done
+    for f in /etc/systemd/system/*.service /etc/systemd/system/*.timer /etc/systemd/system/*.wants/*; do
+        [ -e "$f" ] || [ -L "$f" ] || continue
+        case "$f" in */gisnet-restrict.service) continue ;; esac
+        if [ -L "$f" ]; then echo "svc|$f|$(readlink "$f")"; else echo "svc|$f|$(sha256sum "$f" 2>/dev/null | cut -c1-16)"; fi
+    done
+    while IFS=: read -r u _ uid _ _ home shell; do
+        case "$shell" in */nologin|*/false|'') [ "$uid" = 0 ] || continue ;; esac
+        [ "$uid" = 0 ] || [ "$uid" -ge 1000 ] 2>/dev/null || continue
+        echo "user|$u|uid=$uid $shell"
+        [ -f "$home/.ssh/authorized_keys" ] || continue
+        while IFS= read -r line; do
+            case "$line" in ''|\#*) continue ;; esac
+            fp="$(printf '%s\n' "$line" | ssh-keygen -lf - 2>/dev/null | awk '{print $2}' || true)"
+            [ -n "$fp" ] && echo "key|$u $fp|${line##* }"
+        done < "$home/.ssh/authorized_keys"
+    done < /etc/passwd
+}
+baseline_save() { # baseline_save [jenis] -- tanpa jenis: semuanya; dengan jenis: ganti bagian itu saja
+    [ -w "$STATE_DIR" ] || { mkdir -p "$STATE_DIR" 2>/dev/null && chmod 700 "$STATE_DIR"; } || return 0
+    local now tmp; now="$(snapshot | sort -u)"; tmp="$BASELINE.tmp"
+    if [ -n "${1-}" ] && [ -f "$BASELINE" ]; then
+        { grep -v "^$1|" "$BASELINE" | grep -v '^#' || true; grep "^$1|" <<< "$now" || true; } | sort -u > "$tmp"
+    else
+        printf '%s\n' "$now" > "$tmp"
+    fi
+    { echo "# baseline $(date +%s)"; cat "$tmp"; } > "$BASELINE"; rm -f "$tmp"; chmod 600 "$BASELINE"
+}
+changes_json() { # JSON array perubahan sejak baseline + temuan langsung (program di /tmp, koneksi penambang)
+    local now base out='' n=0 typ item sig old p f rest
+    if [ ! -f "$BASELINE" ]; then baseline_save; printf '[]'; return 0; fi
+    now="$(snapshot | sort -u)"; base="$(grep -v '^#' "$BASELINE" || true)"
+    while IFS='|' read -r typ item sig; do
+        [ -n "$typ" ] || continue
+        old="$(awk -F'|' -v t="$typ" -v i="$item" '$1==t && $2==i {print $3; exit}' <<< "$base")"
+        if [ -z "$old" ] && ! grep -qF "$typ|$item|" <<< "$base"; then p=baru
+        elif [ "$old" != "$sig" ]; then p=berubah
+        else continue; fi
+        out="$out${out:+,}{\"type\":\"$typ\",\"item\":$(json_str "${item:0:200}"),\"change\":\"$p\",\"detail\":$(json_str "${sig:0:120}")}"
+        n=$((n + 1)); [ "$n" -ge 30 ] && break
+    done <<< "$now"
+    # Program yang bisa dijalankan di folder sementara -- tempat favorit penyusup.
+    while IFS= read -r f; do
+        [ -n "$f" ] && [ "$n" -lt 30 ] || continue
+        out="$out${out:+,}{\"type\":\"tmpexec\",\"item\":$(json_str "${f:0:200}"),\"change\":\"ada\",\"detail\":$(json_str "$(stat -c '%U %s byte' "$f" 2>/dev/null || true)")}"
+        n=$((n + 1))
+    done < <(find /tmp /var/tmp /dev/shm -xdev -maxdepth 3 -type f -perm -u+x -size +8k 2>/dev/null | head -10)
+    # Koneksi keluar ke port khas kolam penambang kripto.
+    while read -r rest; do
+        [ -n "$rest" ] && [ "$n" -lt 30 ] || continue
+        out="$out${out:+,}{\"type\":\"minerconn\",\"item\":$(json_str "${rest%% *}"),\"change\":\"ada\",\"detail\":$(json_str "${rest#* }")}"
+        n=$((n + 1))
+    done < <(ss -Htnp state established 2>/dev/null | awk -v ports=" $MINER_PORTS " '{peer=$4; port=peer; sub(/.*:/,"",port); if (index(ports, " " port " ")) { proc=""; if (match($0, /\(\("[^"]+"/)) proc=substr($0, RSTART+3, RLENGTH-4); print peer, proc } }' | head -5)
+    printf '[%s]' "$out"
+}
+cmd_baseline() {
+    need_root
+    case "${1-show}" in
+        accept|terima) baseline_save; c_ok "Kondisi sekarang dicatat sebagai normal (baseline baru)." ;;
+        show|lihat|'') echo; echo " Baseline: $(sed -n 's/^# baseline //p' "$BASELINE" 2>/dev/null | head -1 | xargs -r -I{} date -d @{} '+%d/%m/%Y %H:%M' 2>/dev/null || echo 'belum ada')"
+                       echo " Perubahan sejak baseline:"; changes_json | grep -oE '"type":"[a-z]+","item":"[^"]*","change":"[a-z]+"' | sed 's/"type":"//; s/","item":"/  /; s/","change":"/  (/; s/"$/)/; s/^/   /' || echo "   (tidak ada)"; echo ;;
+        *) die "Perintah baseline tidak dikenal: $1 (show | accept)" ;;
+    esac
+}
+
+# ========================================= BATASI PORT BERBAHAYA (2.15) ===
+# Port (mis. 3306) hanya boleh diakses dari server ini sendiri: tabel nftables sendiri
+# "gisnet_restrict" + layanan systemd supaya tetap berlaku setelah reboot.
+RESTRICT_LIST="$STATE_DIR/restricted-ports"
+RESTRICT_NFT="$STATE_DIR/restrict.nft"
+RESTRICT_UNIT=/etc/systemd/system/gisnet-restrict.service
+restricted_ports() { sort -un "$RESTRICT_LIST" 2>/dev/null | grep -E '^[0-9]+$' || true; }
+restrict_apply() { # tulis & muat aturan dari daftar port
+    have nft || { c_warn "nft tidak tersedia -- port tidak bisa dibatasi otomatis."; return 1; }
+    local ports v4 v6 list
+    list="$(restricted_ports | paste -sd, - | sed 's/,/, /g')"
+    if [ -z "$list" ]; then
+        nft delete table inet gisnet_restrict 2>/dev/null || true
+        rm -f "$RESTRICT_NFT"; systemctl disable --now gisnet-restrict.service >/dev/null 2>&1 || true; rm -f "$RESTRICT_UNIT"
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        return 0
+    fi
+    v4="$(hostname -I 2>/dev/null | tr ' ' '\n' | grep -E '^[0-9]+\.' | paste -sd, - | sed 's/,/, /g')"
+    v6="$(ip -6 addr show scope global 2>/dev/null | awk '/inet6/{sub(/\/.*/,"",$2); print $2}' | paste -sd, - | sed 's/,/, /g')"
+    {
+        echo "# gis-secured: port berbahaya hanya dari server ini sendiri (dibuat $(date '+%Y-%m-%d %H:%M'))"
+        echo "table inet gisnet_restrict"
+        echo "delete table inet gisnet_restrict"
+        echo "table inet gisnet_restrict {"
+        echo "    chain input {"
+        echo "        type filter hook input priority -5; policy accept;"
+        echo "        tcp dport { $list } iifname \"lo\" accept"
+        [ -n "$v4" ] && echo "        tcp dport { $list } ip saddr { $v4 } accept"
+        [ -n "$v6" ] && echo "        tcp dport { $list } ip6 saddr { $v6 } accept"
+        echo "        tcp dport { $list } drop"
+        echo "    }"
+        echo "}"
+    } > "$RESTRICT_NFT.tmp"
+    nft -c -f "$RESTRICT_NFT.tmp" || { rm -f "$RESTRICT_NFT.tmp"; c_err "Aturan nftables tidak valid -- dibatalkan."; return 1; }
+    mv -f "$RESTRICT_NFT.tmp" "$RESTRICT_NFT"; chmod 600 "$RESTRICT_NFT"
+    nft -f "$RESTRICT_NFT"
+    if [ "${HAS_SYSTEMD:-0}" -eq 1 ]; then
+        printf '[Unit]\nDescription=gis-secured: batasi port berbahaya ke server ini sendiri\nAfter=network-online.target nftables.service firewalld.service ufw.service\n\n[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=%s -f %s\n\n[Install]\nWantedBy=multi-user.target\n' \
+            "$(command -v nft)" "$RESTRICT_NFT" > "$RESTRICT_UNIT"
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        systemctl enable gisnet-restrict.service >/dev/null 2>&1 || true
+    fi
+    c_ok "Port dibatasi ke server ini sendiri: $list."
+}
+cmd_restrict() { # restrict [list | add <port> | remove <port>]
+    need_root; detect_os
+    local p="${2-}"
+    case "${1-list}" in
+        list|''|lihat) echo " Port dibatasi: $(restricted_ports | paste -sd' ' - | sed 's/^$/(tidak ada)/')" ;;
+        add|tambah|remove|hapus)
+            [[ "$p" =~ ^[0-9]+$ ]] && [ "$p" -ge 1 ] && [ "$p" -le 65535 ] || die "Port tidak valid: ${p:-kosong}"
+            case ",$(ssh_ports)," in *",$p,"*) die "Port $p dipakai SSH -- tidak boleh dibatasi (server bisa terkunci)." ;; esac
+            mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR"; touch "$RESTRICT_LIST"
+            if [ "$1" = add ] || [ "$1" = tambah ]; then echo "$p" >> "$RESTRICT_LIST"
+            else grep -vx "$p" "$RESTRICT_LIST" > "$RESTRICT_LIST.tmp" || true; mv -f "$RESTRICT_LIST.tmp" "$RESTRICT_LIST"; fi
+            restricted_ports > "$RESTRICT_LIST.tmp"; mv -f "$RESTRICT_LIST.tmp" "$RESTRICT_LIST"
+            restrict_apply ;;
+        *) die "Perintah restrict tidak dikenal (list | add <port> | remove <port>)" ;;
+    esac
+}
+report_apply_restrict() { # {"port_restrict":{"action":"add|remove","port":N}} -- perlu izin port
+    local m action port
+    m="$(printf '%s' "$1" | grep -oE '"port_restrict" *: *\{ *"action" *: *"(add|remove)" *, *"port" *: *[0-9]{1,5} *\}' | head -1 || true)"
+    [ -n "$m" ] || return 0
+    if [ ! -f "$ALLOW_PORT" ]; then c_warn "Aplikasi meminta batasi port, tetapi server ini tidak mengizinkan (report allow-port on)."; return 0; fi
+    action="$(sed -E 's/.*"action" *: *"([a-z]+)".*/\1/' <<< "$m")"; port="$(sed -E 's/.*"port" *: *([0-9]+).*/\1/' <<< "$m")"
+    logger -t gisnet-secure-ssh "batasi port $action $port diminta dari aplikasi" 2>/dev/null || true
+    ( cmd_restrict "$action" "$port" ) >> /var/log/gisnet-secure-ssh-restrict.log 2>&1 || true
+    ( GISNET_NONINTERACTIVE=1 "$SELF_INSTALL" report now quiet </dev/null >/dev/null 2>&1 & ) 2>/dev/null || true
+}
+report_apply_baseline() { # {"baseline_accept":true} -- tandai kondisi sekarang normal (izin whitelist/port)
+    grep -qE '"baseline_accept" *: *true' <<< "$1" || return 0
+    if ! allows_whitelist; then c_warn "Aplikasi meminta terima baseline, tetapi server ini tidak mengizinkan."; return 0; fi
+    logger -t gisnet-secure-ssh "baseline diterima dari aplikasi" 2>/dev/null || true
+    baseline_save
+    ( GISNET_NONINTERACTIVE=1 "$SELF_INSTALL" report now quiet </dev/null >/dev/null 2>&1 & ) 2>/dev/null || true
 }
 
 # ======================================================== LAPORAN APLIKASI ===
@@ -1235,6 +1397,8 @@ report_send() {
     report_apply_whitelist "$body"
     report_apply_dns "$body"
     report_apply_key "$body"
+    report_apply_restrict "$body"
+    report_apply_baseline "$body"
 }
 report_host() { # nama host dari REPORT_URL
     printf '%s' "${REPORT_URL-}" | sed -E 's#^[a-zA-Z]+://##; s#[/:?].*$##'
@@ -1717,6 +1881,8 @@ case "${1-}" in
     key|keys|kunci)       shift; cmd_key "$@" ;;
     port)                 shift; cmd_port "$@" ;;
     dns)                  shift; cmd_dns "$@" ;;
+    baseline)             shift; cmd_baseline "$@" ;;
+    restrict|batasi)      shift; cmd_restrict "$@" ;;
     restore)              shift; cmd_restore "$@" ;;
     report|laporan)       shift; cmd_report "$@" ;;
     checks|periksa)       shift; cmd_checks ;;
