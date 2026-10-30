@@ -176,6 +176,8 @@ Mulai v2.18 juga dilaporkan **jam server** (tersinkron NTP atau tidak, dan selis
 
 Mulai v2.20 peringatan palsu rkhunter yang umum (`/etc/.updated`, man page `.containerignore`, `PermitRootLogin` yang hanya diatur di `sshd_config.d`) dikecualikan lewat `/etc/rkhunter.conf.local` (dikelola skrip; file buatan admin tidak disentuh), dan file cron milik paket rkhunter/chkrootkit tidak dihitung sebagai perubahan mencurigakan.
 
+Mulai v2.21 rkhunter dipasang tanpa paket rekomendasi (dulu ikut terpasang server mail exim4/postfix), verifikasi paket dimatikan di server cPanel, dan daftar port backdoor diunduh bila belum ada (AlmaLinux/EPEL).
+
 ### Batasi port berbahaya (mulai v2.15)
 
 ```bash
