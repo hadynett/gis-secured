@@ -119,6 +119,8 @@ gisnet-secure-ssh whitelist remove 203.0.113.5       # atau nomor urutnya: remov
 
 Perubahan langsung berlaku (fail2ban dimuat ulang) dan IP yang baru ditambahkan langsung dibuka blokirnya. `127.0.0.1/8` dan `::1` bawaan, tidak bisa dihapus.
 
+Mulai v2.9 whitelist juga bisa diubah dari aplikasi pemantau (`gisnet-secure-ssh report allow-whitelist on`, otomatis aktif bila ganti port sudah diizinkan). Subnet yang terlalu luas (lebih luas dari /16 IPv4 atau /32 IPv6) ditolak supaya fail2ban tetap berguna.
+
 ### Kunci SSH
 
 ```bash
@@ -129,6 +131,8 @@ gisnet-secure-ssh key list --user deploy             # user lain
 ```
 
 Kunci **terakhir tidak bisa dihapus** selama login password mati, supaya server tidak terkunci.
+
+Mulai v2.9 kunci root juga bisa ditambah/dihapus dari aplikasi pemantau, tetapi **hanya bila diizinkan sendiri** di server: `gisnet-secure-ssh report allow-key on` (tidak ikut izin port, karena kunci = akses root penuh). Isi kunci tidak pernah dikirim ke aplikasi — hanya nama dan sidik jarinya.
 
 ### Ganti port SSH (dua langkah)
 
@@ -143,6 +147,17 @@ Skrip otomatis membuka port di **firewalld / ufw**, mendaftarkannya di **SELinux
 #### Ganti port dari aplikasi (mulai v2.6)
 
 Bila diizinkan (`gisnet-secure-ssh report allow-port on`), port SSH juga bisa diganti dari aplikasi pemantau dengan dua langkah yang sama: **tambah port baru** (port lama tetap dibuka), lalu **tutup port lama** — tombolnya baru aktif setelah port baru terlihat aktif di laporan dan aplikasi berhasil terhubung ke port itu. Hanya port 22 atau 1024–65535 yang diterima.
+
+### DNS server (mulai v2.9)
+
+```bash
+gisnet-secure-ssh dns                                  # DNS yang dipakai, pengaturnya, dan uji cari nama
+gisnet-secure-ssh dns set 8.8.8.8 1.1.1.1 2001:4860:4860::8888
+```
+
+`dns set` menyesuaikan diri dengan pengatur DNS di server (**NetworkManager**, **systemd-resolved**, atau file `/etc/resolv.conf` biasa), lalu menguji apakah alamat aplikasi pemantau masih bisa ditemukan. Bila gagal, **DNS lama dikembalikan otomatis**. DNS juga bisa diganti dari aplikasi (`report allow-dns on`, otomatis aktif bila ganti port sudah diizinkan).
+
+Bila DNS server mati, laporan tetap terkirim lewat IP aplikasi yang terakhir dikenal, dan aplikasi menandai server dengan **DNS bermasalah**.
 
 ### Kembalikan dari cadangan
 

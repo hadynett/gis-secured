@@ -36,7 +36,11 @@
 #     report allow-reboot on|off             izinkan reboot (sekarang / 00.00 / batal) dari aplikasi
 #     report allow-update on|off             izinkan update skrip dari aplikasi
 #     report allow-port on|off               izinkan ganti port SSH dari aplikasi (dua langkah)
+#     report allow-whitelist on|off          izinkan ubah whitelist dari aplikasi (otomatis bila allow-port on)
+#     report allow-dns on|off                izinkan ganti DNS dari aplikasi (otomatis bila allow-port on)
+#     report allow-key on|off                izinkan tambah/hapus kunci SSH root dari aplikasi (izin terpisah)
 #     report shared-blocklist on|off         blokir bersama: IP penyerang dari server GISNET lain
+#     dns [show|set <ip> [ip] [ip]]          lihat / ganti DNS server (diuji, batal otomatis bila gagal)
 #     update [--check] [--force]             perbarui skrip ke versi terbaru, pengaturan tetap
 #     checks                                 pemeriksaan: kesehatan, port terbuka, proses, login SSH (JSON)
 #
@@ -51,7 +55,7 @@ set -euo pipefail
 # dianggap tidak ada saat perintah datang dari aplikasi (ditemukan 2026-10-29 di server NMS).
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:$PATH}"
 
-SCRIPT_VERSION='2.8'
+SCRIPT_VERSION='2.9'
 SELF_INSTALL=/usr/local/sbin/gisnet-secure-ssh
 STATE_DIR=/etc/gisnet-secure-ssh
 REPORT_CONF="$STATE_DIR/report.conf"
@@ -61,6 +65,12 @@ WEB_PROXY_STATE="$STATE_DIR/web-proxy"     # cloudflare | proxy -- jail web dile
 SHARED_OFF="$STATE_DIR/shared-blocklist-off"
 ALLOW_UPDATE="$STATE_DIR/allow-update"
 ALLOW_PORT="$STATE_DIR/allow-port"
+# 2.9: whitelist & DNS dari aplikasi -- diizinkan oleh file sendiri, atau ikut izin port (lebih berisiko).
+ALLOW_WHITELIST="$STATE_DIR/allow-whitelist"
+ALLOW_DNS="$STATE_DIR/allow-dns"
+ALLOW_KEY="$STATE_DIR/allow-key"            # kunci SSH root dari aplikasi -- SELALU izin terpisah (akses root penuh)
+REPORT_IP_CACHE="$STATE_DIR/report-ip"      # IP aplikasi terakhir -- laporan tetap terkirim saat DNS mati
+DNS_RESULT="$STATE_DIR/dns-result"          # hasil ganti DNS terakhir (dilaporkan ke aplikasi)
 UPDATE_URL_DEFAULT='https://raw.githubusercontent.com/hadynett/gis-secured/main/gisnet-secure-ssh.sh'
 JAIL=/etc/fail2ban/jail.d/gisnet.local
 F2B_LOG=/var/log/fail2ban.log
@@ -692,7 +702,8 @@ cmd_status() {
     echo " Update otomatis: $(auto_update_status)"
     echo " Laporan       : $([ -f "$REPORT_CONF" ] && . "$REPORT_CONF" && echo "aktif ke $REPORT_URL" || echo 'tidak aktif')"
     echo " Reboot via app: $([ -f "$ALLOW_REBOOT" ] && echo diizinkan || echo 'tidak diizinkan')$( s="$(reboot_scheduled_at)"; [ -n "$s" ] && echo " · terjadwal $(date -d "@$s" '+%d/%m %H:%M')" )"
-    echo " Port via app  : $([ -f "$ALLOW_PORT" ] && echo diizinkan || echo 'tidak diizinkan')"
+    echo " Port via app  : $([ -f "$ALLOW_PORT" ] && echo diizinkan || echo 'tidak diizinkan') · whitelist: $(allows_whitelist && echo diizinkan || echo 'tidak') · DNS: $(allows_dns && echo diizinkan || echo 'tidak') · kunci: $([ -f "$ALLOW_KEY" ] && echo diizinkan || echo 'tidak')"
+    echo " DNS           : $(dns_servers | paste -sd' ' - || true) ($(dns_manager))$(dns_ok || echo ' -- TIDAK BISA MENCARI NAMA')"
     echo " Update via app: $([ -f "$ALLOW_UPDATE" ] && echo diizinkan || echo 'tidak diizinkan') · blokir bersama: $([ -f "$SHARED_OFF" ] && echo 'tidak aktif' || echo aktif)"
     [ -f "$WEB_PROXY_STATE" ] && echo " Jail web      : dilewati -- website di belakang $(cat "$WEB_PROXY_STATE")"
     # --- pemeriksaan server
@@ -1153,11 +1164,19 @@ report_json() {
     fi
     [ -f /var/run/reboot-required ] && reboot_req=true
     sched="$(reboot_scheduled_at)"
-    printf '{"version":%s,"hostname":%s,"os":%s,"ip":%s,"uptime_seconds":%s,"fail2ban_running":%s,"jails":[%s],"whitelist":%s,"ssh":{"ports":%s,"password_auth":%s,"root_login":%s},"auto_update":%s,"recent_bans":[%s],"allow_reboot":%s,"reboot_required":%s,"reboot_scheduled_at":%s,"allow_update":%s,"allow_port":%s,"shared_blocklist":%s,"banned_ips":[%s],%s,"generated_at":%s}\n' \
+    local allow_wl=false allow_dns=false dns_good=false allow_key=false
+    [ -f "$ALLOW_KEY" ] && allow_key=true
+    allows_whitelist && allow_wl=true
+    allows_dns && allow_dns=true
+    dns_ok && dns_good=true
+    printf '{"version":%s,"hostname":%s,"os":%s,"ip":%s,"uptime_seconds":%s,"fail2ban_running":%s,"jails":[%s],"whitelist":%s,"ssh":{"ports":%s,"password_auth":%s,"root_login":%s},"auto_update":%s,"recent_bans":[%s],"allow_reboot":%s,"reboot_required":%s,"reboot_scheduled_at":%s,"allow_update":%s,"allow_port":%s,"allow_whitelist":%s,"allow_dns":%s,"allow_key":%s,"ssh_keys":[%s],"dns":{"servers":%s,"manager":%s,"ok":%s,"last_change":%s},"shared_blocklist":%s,"banned_ips":[%s],%s,"generated_at":%s}\n' \
         "$(json_str "$SCRIPT_VERSION")" "$(json_str "$(hostname)")" "$(json_str "$OS_NAME")" "$(json_str "$ip")" \
         "$(awk '{print int($1)}' /proc/uptime 2>/dev/null || echo 0)" "$running" "$jails" \
         "$(json_str "$(wl_current | paste -sd' ' - || true)")" "$(json_str "$ports")" "$(json_str "${pw:-}")" "$(json_str "${root:-}")" \
-        "$(json_str "$(auto_update_status)")" "$recent" "$allow" "$reboot_req" "${sched:-null}" "$allow_up" "$allow_port" "$shared" "$banned_ips" "$(checks_fields)" "$(date +%s)"
+        "$(json_str "$(auto_update_status)")" "$recent" "$allow" "$reboot_req" "${sched:-null}" "$allow_up" "$allow_port" \
+        "$allow_wl" "$allow_dns" "$allow_key" "$(keys_json)" "$(json_str "$(dns_servers | head -6 | paste -sd' ' - || true)")" "$(json_str "$(dns_manager)")" "$dns_good" \
+        "$(json_str "$(head -c 300 "$DNS_RESULT" 2>/dev/null || true)")" \
+        "$shared" "$banned_ips" "$(checks_fields)" "$(date +%s)"
 }
 reboot_scheduled_at() { # epoch detik jadwal reboot systemd, kosong bila tidak ada
     local usec
@@ -1184,14 +1203,37 @@ report_send() {
     # shellcheck disable=SC1090
     . "$REPORT_CONF"
     have curl || pkg_install curl >/dev/null 2>&1 || die "curl tidak tersedia."
-    local out code body
-    out="$(report_json | curl -sS -w '\n%{http_code}' --max-time 20 -X POST -H 'Content-Type: application/json' -H 'Accept: application/json' -H "Authorization: Bearer $REPORT_TOKEN" --data-binary @- "$REPORT_URL" 2>/dev/null || echo 000)"
+    local out code body resolve=()
+    mapfile -t resolve < <(report_resolve_args)
+    out="$(report_json | curl -sS -w '\n%{http_code}' --max-time 20 ${resolve[@]+"${resolve[@]}"} -X POST -H 'Content-Type: application/json' -H 'Accept: application/json' -H "Authorization: Bearer $REPORT_TOKEN" --data-binary @- "$REPORT_URL" 2>/dev/null || echo 000)"
     code="${out##*$'\n'}"; body="${out%$'\n'*}"; [ "$body" = "$out" ] && body=''
     case "$code" in 2*) [ "${1-}" = quiet ] || c_ok "Laporan terkirim ($code)." ;; *) c_err "Laporan gagal (HTTP $code)."; return 1 ;; esac
+    [ "${#resolve[@]}" -gt 0 ] && [ "${1-}" != quiet ] && c_warn "DNS server ini tidak bisa mencari nama -- laporan dikirim lewat IP aplikasi terakhir."
     report_apply_reboot "$body"
     report_apply_shared "$body"
     report_apply_update "$body"
     report_apply_port "$body"
+    report_apply_whitelist "$body"
+    report_apply_dns "$body"
+    report_apply_key "$body"
+}
+report_host() { # nama host dari REPORT_URL
+    printf '%s' "${REPORT_URL-}" | sed -E 's#^[a-zA-Z]+://##; s#[/:?].*$##'
+}
+report_resolve_args() { # cetak "--resolve host:port:ip" bila DNS mati tetapi IP aplikasi pernah tersimpan
+    local host port ip
+    host="$(report_host)"; [ -n "$host" ] || return 0
+    port="$(printf '%s' "$REPORT_URL" | sed -nE 's#^[a-zA-Z]+://[^/:]+:([0-9]+).*#\1#p')"
+    [ -n "$port" ] || { case "$REPORT_URL" in http://*) port=80 ;; *) port=443 ;; esac; }
+    ip="$(timeout 6 getent ahosts "$host" 2>/dev/null | awk '$2=="STREAM"{print $1; exit}' || true)"
+    if [ -n "$ip" ]; then
+        printf '%s\n' "$ip" > "$REPORT_IP_CACHE" 2>/dev/null || true
+        return 0
+    fi
+    ip="$(head -1 "$REPORT_IP_CACHE" 2>/dev/null || true)"
+    valid_ip "$ip" || return 0
+    case "$ip" in *:*) ip="[$ip]" ;; esac
+    printf '%s\n' --resolve "$host:$port:$ip"
 }
 report_apply_port() { # report_apply_port <balasan-json> -- {"ssh_port":{"action":"add|remove_old","port":N}}, perlu izin
     local m action port
@@ -1237,6 +1279,201 @@ report_apply_update() { # report_apply_update <balasan-json> -- hanya bila diizi
     ( GISNET_NONINTERACTIVE=1 nohup "$SELF_INSTALL" update --quiet >> /var/log/gisnet-secure-ssh-update.log 2>&1 & ) 2>/dev/null || true
     c_ok "Update skrip dimulai (log: /var/log/gisnet-secure-ssh-update.log)."
 }
+# ===================================================== WHITELIST & DNS (2.9) ===
+# Diubah dari aplikasi lewat balasan laporan. Izin: report allow-whitelist / allow-dns on,
+# atau otomatis bila ganti port SSH sudah diizinkan (izin yang lebih berisiko).
+allows_whitelist() { [ -f "$ALLOW_WHITELIST" ] || [ -f "$ALLOW_PORT" ]; }
+allows_dns()       { [ -f "$ALLOW_DNS" ] || [ -f "$ALLOW_PORT" ]; }
+
+wl_too_wide() { # subnet terlalu luas untuk whitelist dari aplikasi (melumpuhkan fail2ban)
+    local ip="$1" bits
+    case "$ip" in */*) bits="${ip##*/}" ;; *) return 1 ;; esac
+    case "$ip" in *:*) [ "$bits" -lt 32 ] ;; *) [ "$bits" -lt 16 ] ;; esac
+}
+report_apply_whitelist() { # {"whitelist_change":{"add":["ip",..],"remove":["ip",..]}}
+    local m add='' remove='' ip ok_add=() ok_remove=()
+    m="$(printf '%s' "$1" | grep -oE '"whitelist_change" *: *\{[^}]*\}' | head -1 || true)"
+    [ -n "$m" ] || return 0
+    if ! allows_whitelist; then c_warn "Aplikasi meminta ubah whitelist, tetapi server ini tidak mengizinkan."; return 0; fi
+    # Ambil isi [...] saja: kata kunci "add" sendiri lolos pola heksadesimal IPv6.
+    add="$(printf '%s' "$m" | grep -oE '"add" *: *\[[^]]*\]' | sed 's/^[^[]*\[//' | grep -oE '"[0-9A-Fa-f:./]+"' | tr -d '"' | head -20 || true)"
+    remove="$(printf '%s' "$m" | grep -oE '"remove" *: *\[[^]]*\]' | sed 's/^[^[]*\[//' | grep -oE '"[0-9A-Fa-f:./]+"' | tr -d '"' | head -20 || true)"
+    for ip in $add; do
+        if ! valid_ip "$ip"; then c_warn "Whitelist: $ip bukan IP yang valid -- dilewati."
+        elif wl_too_wide "$ip"; then c_warn "Whitelist: $ip terlalu luas (minimal /16 IPv4, /32 IPv6) -- dilewati."
+        else ok_add+=("$ip"); fi
+    done
+    for ip in $remove; do valid_ip "$ip" && ok_remove+=("$ip"); done
+    [ "${#ok_add[@]}" -gt 0 ] || [ "${#ok_remove[@]}" -gt 0 ] || return 0
+    logger -t gisnet-secure-ssh "whitelist dari aplikasi: tambah ${ok_add[*]-} hapus ${ok_remove[*]-}" 2>/dev/null || true
+    {
+        [ "${#ok_add[@]}" -gt 0 ] && wl_add "${ok_add[@]}"
+        [ "${#ok_remove[@]}" -gt 0 ] && wl_remove "${ok_remove[@]}"
+    } >> /var/log/gisnet-secure-ssh-whitelist.log 2>&1 || true
+    c_ok "Whitelist diperbarui dari aplikasi (log: /var/log/gisnet-secure-ssh-whitelist.log)."
+    # Laporan baru supaya aplikasi langsung melihat whitelist terbaru.
+    ( GISNET_NONINTERACTIVE=1 "$SELF_INSTALL" report now quiet </dev/null >/dev/null 2>&1 & ) 2>/dev/null || true
+}
+
+dns_manager() { # siapa yang mengatur /etc/resolv.conf
+    local ns
+    ns="$(awk '$1=="nameserver"{print $2; exit}' /etc/resolv.conf 2>/dev/null || true)"
+    if [ "$ns" = 127.0.0.53 ] && have resolvectl; then echo systemd-resolved
+    elif have nmcli && systemctl is-active --quiet NetworkManager 2>/dev/null && grep -q 'NetworkManager' /etc/resolv.conf 2>/dev/null; then echo networkmanager
+    elif [ -L /etc/resolv.conf ]; then echo "symlink:$(readlink -f /etc/resolv.conf)"
+    else echo file; fi
+}
+dns_servers() { # DNS yang benar-benar dipakai, satu per baris
+    if [ "$(dns_manager)" = systemd-resolved ]; then
+        resolvectl dns 2>/dev/null | sed 's/^[^:]*://' | tr ' ' '\n' | sed '/^$/d; s/#.*//' | awk '!seen[$0]++'
+    else
+        awk '$1=="nameserver"{print $2}' /etc/resolv.conf 2>/dev/null
+    fi
+}
+dns_test_host() { # nama yang diuji: alamat aplikasi bila laporan aktif
+    local h=''
+    # shellcheck disable=SC1090
+    [ -f "$REPORT_CONF" ] && h="$( . "$REPORT_CONF"; report_host )"
+    echo "${h:-raw.githubusercontent.com}"
+}
+dns_ok() { timeout 6 getent ahosts "$(dns_test_host)" >/dev/null 2>&1; }
+
+dns_set() { # dns_set <ip> [ip] [ip] -- ganti DNS, uji, kembalikan otomatis bila gagal
+    local mgr ip v4='' v6='' bak con dev old ok=0 when
+    [ $# -ge 1 ] && [ $# -le 3 ] || die "Isi 1 sampai 3 alamat DNS."
+    for ip in "$@"; do
+        case "$ip" in */*) die "DNS harus alamat IP tunggal, bukan subnet: $ip" ;; esac
+        valid_ip "$ip" || die "Alamat DNS tidak valid: $ip"
+        case "$ip" in *:*) v6="$v6 $ip" ;; *) v4="$v4 $ip" ;; esac
+    done
+    v4="${v4# }"; v6="${v6# }"
+    mgr="$(dns_manager)"; when="$(date '+%Y-%m-%d %H:%M')"
+    bak="$STATE_DIR/dns-backup-$(date +%Y%m%d-%H%M%S)"; mkdir -p "$bak"; chmod 700 "$STATE_DIR" "$bak"
+    case "$mgr" in
+        networkmanager)
+            con="$(nmcli -t -f NAME,DEVICE con show --active 2>/dev/null | awk -F: '$2!="" && $2!="lo"{print $1; exit}')"
+            dev="$(nmcli -t -f NAME,DEVICE con show --active 2>/dev/null | awk -F: '$2!="" && $2!="lo"{print $2; exit}')"
+            [ -n "$con" ] || die "Koneksi NetworkManager aktif tidak ditemukan."
+            # Satu file per kolom: alamat IPv6 berisi ':' yang bentrok dengan pemisah nmcli -g.
+            for old in ipv4.dns ipv4.ignore-auto-dns ipv6.dns ipv6.ignore-auto-dns; do
+                nmcli -g "$old" con show "$con" 2>/dev/null | sed 's/\\:/:/g' > "$bak/nm-$old"
+            done
+            nmcli con mod "$con" ipv4.dns "$v4" ipv4.ignore-auto-dns "$([ -n "$v4" ] && echo yes || echo no)" >/dev/null 2>&1 || true
+            nmcli con mod "$con" ipv6.dns "$v6" ipv6.ignore-auto-dns "$([ -n "$v6" ] && echo yes || echo no)" >/dev/null 2>&1 || true
+            nmcli dev reapply "$dev" >/dev/null 2>&1 || nmcli con up "$con" >/dev/null 2>&1 || true ;;
+        systemd-resolved)
+            mkdir -p /etc/systemd/resolved.conf.d
+            [ -f /etc/systemd/resolved.conf.d/gisnet-dns.conf ] && cp -a /etc/systemd/resolved.conf.d/gisnet-dns.conf "$bak/"
+            printf '# gis-secured: DNS dari aplikasi / perintah dns set (%s)\n[Resolve]\nDNS=%s\nDomains=~.\n' "$when" "$*" > /etc/systemd/resolved.conf.d/gisnet-dns.conf
+            systemctl restart systemd-resolved >/dev/null 2>&1 || true ;;
+        file)
+            cp -a /etc/resolv.conf "$bak/resolv.conf"
+            { grep -vE '^[[:space:]]*nameserver[[:space:]]' /etc/resolv.conf 2>/dev/null | grep -v '^# gis-secured'
+              echo "# gis-secured: DNS diganti $when"
+              for ip in "$@"; do echo "nameserver $ip"; done; } > /etc/resolv.conf.gisnet-tmp
+            cat /etc/resolv.conf.gisnet-tmp > /etc/resolv.conf; rm -f /etc/resolv.conf.gisnet-tmp ;;
+        *)
+            rmdir "$bak" 2>/dev/null || true
+            printf '%s gagal: /etc/resolv.conf diatur %s -- ubah manual\n' "$when" "${mgr#symlink:}" > "$DNS_RESULT"
+            die "/etc/resolv.conf diatur oleh ${mgr#symlink:} -- DNS tidak diubah, ubah manual." ;;
+    esac
+    sleep 3
+    for _ in 1 2 3; do dns_ok && { ok=1; break; }; sleep 2; done
+    if [ "$ok" -eq 1 ]; then
+        printf '%s berhasil: %s (%s)\n' "$when" "$*" "$mgr" > "$DNS_RESULT"
+        c_ok "DNS diganti ke: $* ($mgr) -- $(dns_test_host) bisa ditemukan."
+        logger -t gisnet-secure-ssh "DNS diganti ke $*" 2>/dev/null || true
+        return 0
+    fi
+    # Gagal: kembalikan pengaturan lama supaya server tidak kehilangan DNS.
+    case "$mgr" in
+        networkmanager)
+            nmcli con mod "$con" ipv4.dns "$(tr ',' ' ' < "$bak/nm-ipv4.dns")" ipv4.ignore-auto-dns "$(cat "$bak/nm-ipv4.ignore-auto-dns" 2>/dev/null || echo no)" >/dev/null 2>&1 || true
+            nmcli con mod "$con" ipv6.dns "$(tr ',' ' ' < "$bak/nm-ipv6.dns")" ipv6.ignore-auto-dns "$(cat "$bak/nm-ipv6.ignore-auto-dns" 2>/dev/null || echo no)" >/dev/null 2>&1 || true
+            nmcli dev reapply "$dev" >/dev/null 2>&1 || nmcli con up "$con" >/dev/null 2>&1 || true ;;
+        systemd-resolved)
+            if [ -f "$bak/gisnet-dns.conf" ]; then cp -a "$bak/gisnet-dns.conf" /etc/systemd/resolved.conf.d/; else rm -f /etc/systemd/resolved.conf.d/gisnet-dns.conf; fi
+            systemctl restart systemd-resolved >/dev/null 2>&1 || true ;;
+        file) cat "$bak/resolv.conf" > /etc/resolv.conf ;;
+    esac
+    printf '%s gagal: %s tidak bisa mencari %s -- dikembalikan ke DNS lama\n' "$when" "$*" "$(dns_test_host)" > "$DNS_RESULT"
+    logger -t gisnet-secure-ssh "ganti DNS ke $* gagal, dikembalikan" 2>/dev/null || true
+    die "DNS $* tidak bisa mencari $(dns_test_host) -- pengaturan lama dikembalikan."
+}
+report_apply_dns() { # {"dns_change":{"servers":["ip","ip"]}}
+    local m list
+    m="$(printf '%s' "$1" | grep -oE '"dns_change" *: *\{ *"servers" *: *\[[^]]*\] *\}' | head -1 || true)"
+    [ -n "$m" ] || return 0
+    if ! allows_dns; then c_warn "Aplikasi meminta ganti DNS, tetapi server ini tidak mengizinkan."; return 0; fi
+    list="$(printf '%s' "$m" | sed 's/^[^[]*\[//' | grep -oE '"[0-9A-Fa-f:.]+"' | tr -d '"' | head -3 | paste -sd' ' -)"
+    [ -n "$list" ] || return 0
+    logger -t gisnet-secure-ssh "ganti DNS ke $list diminta dari aplikasi" 2>/dev/null || true
+    # Latar belakang: uji + kembalikan otomatis, lalu kirim laporan baru berisi hasilnya.
+    # shellcheck disable=SC2086
+    ( { GISNET_NONINTERACTIVE=1 "$SELF_INSTALL" dns set $list </dev/null
+        GISNET_NONINTERACTIVE=1 "$SELF_INSTALL" report now quiet </dev/null
+      } >> /var/log/gisnet-secure-ssh-dns.log 2>&1 & ) 2>/dev/null || true
+    c_ok "Permintaan ganti DNS ($list) dijalankan (log: /var/log/gisnet-secure-ssh-dns.log)."
+}
+keys_json() { # kunci SSH root untuk laporan: [{"type","comment","fp"}] -- tanpa isi kunci
+    local file line tmp type comment fp first=1
+    file="$(awk -F: '$1=="root"{print $6}' /etc/passwd)/.ssh/authorized_keys"
+    [ -f "$file" ] || return 0
+    tmp="$(mktemp)"
+    while IFS= read -r line; do
+        case "$line" in ''|\#*) continue ;; esac
+        printf '%s\n' "$line" > "$tmp"
+        fp="$(ssh-keygen -lf "$tmp" 2>/dev/null | awk '{print $2}' || true)"
+        type="$(printf '%s' "$line" | grep -oE '(ssh-ed25519|ssh-rsa|ecdsa-sha2-[a-z0-9]+|sk-[a-z0-9@.-]+)' | head -1 || true)"
+        comment="$(printf '%s' "$line" | awk -v t="$type" '{for(i=1;i<=NF;i++) if($i==t){c=""; for(j=i+2;j<=NF;j++) c=c (c?" ":"") $j; print c; exit}}')"
+        [ "$first" -eq 1 ] || printf ','
+        first=0
+        printf '{"type":%s,"comment":%s,"fp":%s}' "$(json_str "$type")" "$(json_str "${comment:0:100}")" "$(json_str "$fp")"
+    done < <(head -50 "$file")
+    rm -f "$tmp"
+}
+report_apply_key() { # {"ssh_key":{"action":"add","key":"ssh-ed25519 AAAA.. nama"}} / {"action":"remove","fp":"SHA256:.."}
+    local m action key fp file line tmp idx=0 sel=''
+    m="$(printf '%s' "$1" | grep -oE '"ssh_key" *: *\{ *"action" *: *"(add|remove)" *, *"(key|fp)" *: *"[^"]+" *\}' | head -1 || true)"
+    [ -n "$m" ] || return 0
+    if [ ! -f "$ALLOW_KEY" ]; then c_warn "Aplikasi meminta ubah kunci SSH, tetapi server ini tidak mengizinkan."; return 0; fi
+    action="$(printf '%s' "$m" | sed -E 's/.*"action" *: *"([a-z]+)".*/\1/')"
+    {
+        if [ "$action" = add ]; then
+            key="$(printf '%s' "$m" | sed -E 's/.*"key" *: *"([^"]+)".*/\1/')"
+            logger -t gisnet-secure-ssh "kunci SSH ${key##* } ditambahkan dari aplikasi" 2>/dev/null || true
+            ( key_add root "$key" )   # subshell: kunci tidak valid tidak menghentikan laporan
+        else
+            fp="$(printf '%s' "$m" | sed -E 's/.*"fp" *: *"([^"]+)".*/\1/')"
+            file="$(key_file_of root)"; tmp="$(mktemp)"
+            while IFS= read -r line; do
+                case "$line" in ''|\#*) continue ;; esac
+                idx=$((idx + 1)); printf '%s\n' "$line" > "$tmp"
+                [ "$(ssh-keygen -lf "$tmp" 2>/dev/null | awk '{print $2}')" = "$fp" ] && { sel="$idx"; break; }
+            done < "$file"
+            rm -f "$tmp"
+            if [ -n "$sel" ]; then
+                logger -t gisnet-secure-ssh "kunci SSH $fp dihapus dari aplikasi" 2>/dev/null || true
+                ( key_remove root "$sel" )   # subshell: die (mis. kunci terakhir) tidak menghentikan laporan
+            else c_warn "Kunci $fp tidak ditemukan -- tidak ada yang dihapus."; fi
+        fi
+    } >> /var/log/gisnet-secure-ssh-key.log 2>&1 || true
+    c_ok "Permintaan kunci SSH ($action) dijalankan (log: /var/log/gisnet-secure-ssh-key.log)."
+    ( GISNET_NONINTERACTIVE=1 "$SELF_INSTALL" report now quiet </dev/null >/dev/null 2>&1 & ) 2>/dev/null || true
+}
+cmd_dns() {
+    case "${1-show}" in
+        show|lihat|'')
+            echo; echo " DNS dipakai : $(dns_servers | paste -sd' ' - || true)"
+            echo " Diatur oleh : $(dns_manager)"
+            echo " Uji nama    : $(dns_test_host) -> $(dns_ok && echo bisa || echo 'GAGAL')"
+            [ -f "$DNS_RESULT" ] && echo " Terakhir    : $(cat "$DNS_RESULT")"
+            echo ;;
+        set|ganti) need_root; shift; dns_set "$@" ;;
+        *) die "Perintah dns tidak dikenal: $1 (show | set <ip> [ip] [ip])" ;;
+    esac
+}
+
 allow_reboot_set() { # allow_reboot_set on|off -- tanpa mengirim laporan
     if [ "$1" = on ]; then
         mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR"; touch "$ALLOW_REBOOT"; chmod 600 "$ALLOW_REBOOT"
@@ -1335,6 +1572,20 @@ cmd_report() {
                        [ -f "$REPORT_CONF" ] && { report_send quiet || true; } ;;
                 *) echo "Ganti port SSH dari aplikasi: $([ -f "$ALLOW_PORT" ] && echo diizinkan || echo 'tidak diizinkan') (ubah: report allow-port on|off)" ;;
             esac ;;
+        allow-whitelist|allow-dns|allow-key|izin-whitelist|izin-dns|izin-kunci)
+            local f what
+            case "$1" in
+                *whitelist) f="$ALLOW_WHITELIST"; what='Ubah whitelist' ;;
+                *dns)       f="$ALLOW_DNS"; what='Ganti DNS' ;;
+                *)          f="$ALLOW_KEY"; what='Tambah/hapus kunci SSH root' ;;
+            esac
+            case "${2-}" in
+                on|ya) mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR"; touch "$f"; chmod 600 "$f"; c_ok "$what dari aplikasi DIIZINKAN."
+                       [ -f "$REPORT_CONF" ] && { report_send quiet || true; } ;;
+                off|tidak) rm -f "$f"; c_ok "$what dari aplikasi tidak diizinkan$([ "$f" != "$ALLOW_KEY" ] && [ -f "$ALLOW_PORT" ] && echo ' (tetapi masih ikut izin port: report allow-port off untuk mencabut semuanya)')."
+                       [ -f "$REPORT_CONF" ] && { report_send quiet || true; } ;;
+                *) echo "$what dari aplikasi: $([ -f "$f" ] && echo diizinkan || echo 'tidak diizinkan') (ubah: report $1 on|off)" ;;
+            esac ;;
         allow-update|izin-update)
             case "${2-}" in
                 on|ya) allow_update_set on; [ -f "$REPORT_CONF" ] && { report_send quiet || true; } ;;
@@ -1347,7 +1598,7 @@ cmd_report() {
                 off|tidak) mkdir -p "$STATE_DIR"; touch "$SHARED_OFF"; fail2ban-client unban --all >/dev/null 2>&1 || true; c_ok "Blokir bersama dimatikan (IP dari server lain tidak diblokir lagi)." ;;
                 *) echo "Blokir bersama: $([ -f "$SHARED_OFF" ] && echo 'tidak aktif' || echo aktif) (ubah: report shared-blocklist on|off)" ;;
             esac ;;
-        *) die "Perintah report tidak dikenal (now | setup <url> <token> | allow-reboot on|off | allow-update on|off | allow-port on|off | shared-blocklist on|off | off | json)" ;;
+        *) die "Perintah report tidak dikenal (now | setup <url> <token> | allow-reboot on|off | allow-update on|off | allow-port on|off | allow-whitelist on|off | allow-dns on|off | allow-key on|off | shared-blocklist on|off | off | json)" ;;
     esac
 }
 
@@ -1423,6 +1674,7 @@ case "${1-}" in
     whitelist)            shift; cmd_whitelist "$@" ;;
     key|keys|kunci)       shift; cmd_key "$@" ;;
     port)                 shift; cmd_port "$@" ;;
+    dns)                  shift; cmd_dns "$@" ;;
     restore)              shift; cmd_restore "$@" ;;
     report|laporan)       shift; cmd_report "$@" ;;
     checks|periksa)       shift; cmd_checks ;;
