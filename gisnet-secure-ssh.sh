@@ -60,7 +60,7 @@ set -euo pipefail
 # dianggap tidak ada saat perintah datang dari aplikasi (ditemukan 2026-10-29 di server NMS).
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:$PATH}"
 
-SCRIPT_VERSION='2.21'
+SCRIPT_VERSION='2.22'
 SELF_INSTALL=/usr/local/sbin/gisnet-secure-ssh
 STATE_DIR=/etc/gisnet-secure-ssh
 REPORT_CONF="$STATE_DIR/report.conf"
@@ -1387,6 +1387,11 @@ baseline_save() { # baseline_save [jenis] -- tanpa jenis: semuanya; dengan jenis
         have flock && { exec 9>"$STATE_DIR/baseline.lock"; flock -w 60 9 || true; }
         local now tmp
         now="$(snapshot | sort -u)"
+        # 2.22: port yang pernah dicatat normal tetap disimpan walau sedang tidak terbuka -- cPanel
+        # (cpsrvd 2082/2083/2095/2096) kadang menutup-buka port, lalu dilaporkan "baru" (Iwak 2026-10-30).
+        if [ -f "$BASELINE" ] && { [ -z "${1-}" ] || [ "${1-}" = port ]; }; then
+            now="$(printf '%s\n%s\n' "$now" "$(grep '^port|' "$BASELINE" || true)" | grep . | sort -u || true)"
+        fi
         tmp="$(mktemp "$STATE_DIR/baseline.XXXXXX")"
         {
             echo "# baseline $(date +%s)"
