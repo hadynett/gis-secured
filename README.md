@@ -170,6 +170,8 @@ gisnet-secure-ssh baseline accept   # semua yang tampil memang wajar -> catat ko
 
 Saat pertama dijalankan, skrip mencatat kondisi normal: jadwal **cron**, **layanan systemd** di `/etc`, **user** yang bisa login / ber-UID 0, dan **kunci SSH**. Setiap laporan berikutnya menyebut apa yang **baru atau berubah**, ditambah program yang bisa dijalankan di `/tmp`, `/var/tmp`, `/dev/shm` dan koneksi keluar ke port khas kolam penambang kripto. Kunci yang ditambah/dihapus lewat `key` atau aplikasi otomatis dianggap wajar.
 
+Mulai v2.16 juga dipantau: **program SUID** baru dan **port** yang baru menerima koneksi dari internet. Setiap jam skrip juga mencoba mengunduh file rahasia (`.env`, `.git/config`, phpinfo, backup `.sql`) dari semua situs di server itu -- hanya yang benar-benar bisa diunduh yang dilaporkan -- dan memeriksa **sertifikat SSL** (web, mail, cPanel) yang habis kurang dari 21 hari.
+
 ### Batasi port berbahaya (mulai v2.15)
 
 ```bash

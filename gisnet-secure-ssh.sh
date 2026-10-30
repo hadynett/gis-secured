@@ -43,7 +43,7 @@
 #     report allow-all on|off                semua izin di atas sekaligus (juga: report setup ... --allow-all)
 #     report shared-blocklist on|off         blokir bersama: IP penyerang dari server GISNET lain
 #     dns [show|set <ip> .. (maks 3, 4 bila systemd-resolved)]  lihat / ganti DNS server (diuji, batal otomatis bila gagal)
-#     baseline [show|accept]                 jejak penyusup: perubahan cron/layanan/user/kunci sejak kondisi normal
+#     baseline [show|accept]                 jejak penyusup: cron/layanan/user/kunci/SUID/port baru sejak kondisi normal
 #     restrict [list|add <port>|remove <port>]   batasi port berbahaya (mis. 3306) ke server ini sendiri
 #     update [--check] [--force]             perbarui skrip ke versi terbaru, pengaturan tetap
 #     checks                                 pemeriksaan: kesehatan, port terbuka, proses, login SSH (JSON)
@@ -59,7 +59,7 @@ set -euo pipefail
 # dianggap tidak ada saat perintah datang dari aplikasi (ditemukan 2026-10-29 di server NMS).
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:$PATH}"
 
-SCRIPT_VERSION='2.15'
+SCRIPT_VERSION='2.16'
 SELF_INSTALL=/usr/local/sbin/gisnet-secure-ssh
 STATE_DIR=/etc/gisnet-secure-ssh
 REPORT_CONF="$STATE_DIR/report.conf"
@@ -1143,11 +1143,12 @@ checks_fields() { # potongan JSON (tanpa kurung kurawal) -- dipakai laporan & pe
     logins="$(checks_logins)"
     web="$(cat "$WEB_PROXY_STATE" 2>/dev/null || true)"
     jails="$( { fail2ban-client status 2>/dev/null | sed -n 's/.*Jail list:[[:space:]]*//p' | tr -d ' ' | tr ',' '\n' | grep -vxE 'sshd|recidive|gisnet-scan|gisnet-shared|' || true; } | awk '{printf "%s\"%s\"", (NR>1?",":""), $0}')"
-    printf '"health":%s,"open_ports":%s,"suspicious":%s,"logins":%s,"logins_7d":%s,"web_proxy":%s,"service_jails":[%s],"changes":%s,"baseline_at":%s,"restricted_ports":[%s]' \
+    printf '"health":%s,"open_ports":%s,"suspicious":%s,"logins":%s,"logins_7d":%s,"web_proxy":%s,"service_jails":[%s],"changes":%s,"baseline_at":%s,"restricted_ports":[%s],"web_leaks":%s,"certs":%s' \
         "$(checks_health)" "$(checks_ports)" "$(checks_processes)" "${logins%|*}" "${logins##*|}" \
         "$([ -n "$web" ] && json_str "$web" || echo null)" "$jails" \
         "$(changes_json)" "$(sed -n 's/^# baseline //p' "$BASELINE" 2>/dev/null | head -1 | grep -E '^[0-9]+$' || echo null)" \
-        "$(restricted_ports | paste -sd, -)"
+        "$(restricted_ports | paste -sd, -)" \
+        "$(web_leaks_json)" "$(certs_json)"
 }
 cmd_checks() { # cetak hasil pemeriksaan sebagai JSON (dipakai skrip status VM aplikasi)
     detect_os
@@ -1184,6 +1185,74 @@ snapshot() { # cetak "jenis|item|sidik" -- cron, layanan systemd di /etc, user l
             [ -n "$fp" ] && echo "key|$u $fp|${line##* }"
         done < "$home/.ssh/authorized_keys"
     done < /etc/passwd
+    # 2.16: program SUID (cara penyusup kembali jadi root) -- dicari paling sering sekali sejam.
+    cached suid 3600 suid_list | while IFS= read -r f; do [ -n "$f" ] && echo "suid|$f|$(sha256sum "$f" 2>/dev/null | cut -c1-16)"; done
+    # 2.16: port yang menerima koneksi dari internet -- layanan baru yang tiba-tiba terbuka.
+    ss -H -tlnp 2>/dev/null | awk '{
+        local = $4; port = local; sub(/.*:/, "", port); addr = local; sub(/:[0-9]+$/, "", addr); gsub(/[\[\]]/, "", addr); sub(/%.*/, "", addr)
+        if (addr ~ /^127\./ || addr == "::1" || addr ~ /^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|169\.254\.|fe80|fd|fc)/) next
+        proc = ""; if (match($0, /\(\("[^"]+"/)) proc = substr($0, RSTART + 3, RLENGTH - 4); sub(/ .*/, "", proc)
+        if (!seen[port]++) print "port|" port "/tcp|" proc
+    }'
+}
+suid_list() { find / -xdev \( -path /proc -o -path /sys -o -path /run -o -path /snap \) -prune -o -type f -perm -4000 -print 2>/dev/null | sort | head -300; }
+cached() { # cached <nama> <detik> <perintah..> -- hasil perintah disimpan, diulang hanya bila sudah basi
+    local name="$1" ttl="$2" f; shift 2; f="$STATE_DIR/cache-$name"
+    if [ -f "$f" ] && [ $(( $(date +%s) - $(stat -c %Y "$f" 2>/dev/null || echo 0) )) -lt "$ttl" ]; then cat "$f"; return 0; fi
+    if [ -w "$STATE_DIR" ]; then "$@" > "$f.tmp" 2>/dev/null; mv -f "$f.tmp" "$f"; cat "$f"; else "$@" 2>/dev/null; fi
+}
+
+# ============================================ WEBSITE & SERTIFIKAT (2.16) ===
+web_hosts() { # nama situs di server ini (nginx server_name, Apache ServerName/ServerAlias) -- maks 40
+    { grep -rhoE '^\s*server_name\s+[^;]+' /etc/nginx/ 2>/dev/null | sed -E 's/^\s*server_name\s+//'
+      grep -rhoiE '^\s*Server(Name|Alias)\s+.+' /etc/apache2/ /etc/httpd/ 2>/dev/null | sed -E 's/^\s*Server(Name|Alias)\s+//I'
+    } | tr ' \t' '\n\n' | sed 's/:.*//' | grep -E '^[A-Za-z0-9][A-Za-z0-9.-]+\.[A-Za-z]{2,}$' | grep -vE '^(localhost|_)$|\.(local|localdomain|invalid)$' \
+      | grep -viE '^(www\.|mail\.|webmail\.|cpanel\.|whm\.|webdisk\.|cpcalendars\.|cpcontacts\.|autodiscover\.|autoconfig\.|ftp\.)' | sort -u | head -40
+}
+web_leaks_scan() { # baris "host|path" untuk file rahasia yang BENAR-BENAR bisa diunduh (isi dicek)
+    have curl || return 0
+    local h p body re
+    while IFS= read -r h; do
+        [ -n "$h" ] || continue
+        for p in '/.env:^[A-Z][A-Z0-9_]+=' '/.env.backup:^[A-Z][A-Z0-9_]+=' '/.git/config:\[core\]' \
+                 '/info.php:phpinfo\(\)|PHP Version' '/phpinfo.php:phpinfo\(\)|PHP Version' \
+                 '/backup.sql:CREATE TABLE|INSERT INTO' '/db.sql:CREATE TABLE|INSERT INTO' '/database.sql:CREATE TABLE|INSERT INTO'; do
+            re="${p#*:}"; p="${p%%:*}"
+            body="$(curl -sk --max-time 4 --max-filesize 200000 --resolve "$h:443:127.0.0.1" --resolve "$h:80:127.0.0.1" -L --max-redirs 2 \
+                    -w '\n@@%{http_code}' "https://$h$p" 2>/dev/null || true)"
+            [ "${body##*@@}" = 200 ] || continue
+            grep -qE "$re" <<< "${body%@@*}" && echo "$h|$p"
+        done
+    done < <(web_hosts)
+}
+web_leaks_json() {
+    local out='' h p
+    while IFS='|' read -r h p; do
+        [ -n "$h" ] && out="$out${out:+,}{\"host\":$(json_str "$h"),\"path\":$(json_str "$p")}"
+    done < <(cached webleaks 3600 web_leaks_scan | head -20)
+    printf '[%s]' "$out"
+}
+certs_scan() { # baris "nama|port|sisa-hari" untuk sertifikat yang habis < 21 hari (atau sudah habis)
+    have openssl || return 0
+    local h port end days
+    while IFS= read -r h; do
+        [ -n "$h" ] || continue
+        for port in 443 465 993 995 2083 2087; do
+            case "$port" in 443) ;; *) [ "$h" = "$(hostname -f 2>/dev/null || hostname)" ] || continue ;; esac
+            ss -H -tln "sport = :$port" 2>/dev/null | grep -q . || continue
+            end="$(echo | timeout 6 openssl s_client -connect "127.0.0.1:$port" -servername "$h" 2>/dev/null | openssl x509 -noout -enddate 2>/dev/null | cut -d= -f2)"
+            [ -n "$end" ] || continue
+            days=$(( ( $(date -d "$end" +%s 2>/dev/null || echo 0) - $(date +%s) ) / 86400 ))
+            [ "$days" -lt 21 ] && echo "$h|$port|$days"
+        done
+    done < <({ web_hosts; hostname -f 2>/dev/null || hostname; } | sort -u)
+}
+certs_json() {
+    local out='' h port days
+    while IFS='|' read -r h port days; do
+        [ -n "$h" ] && out="$out${out:+,}{\"name\":$(json_str "$h"),\"port\":$port,\"days\":$days}"
+    done < <(cached certs 3600 certs_scan | head -20)
+    printf '[%s]' "$out"
 }
 baseline_save() { # baseline_save [jenis] -- tanpa jenis: semuanya; dengan jenis: ganti bagian itu saja
     [ -w "$STATE_DIR" ] || { mkdir -p "$STATE_DIR" 2>/dev/null && chmod 700 "$STATE_DIR"; } || return 0
@@ -1198,6 +1267,9 @@ baseline_save() { # baseline_save [jenis] -- tanpa jenis: semuanya; dengan jenis
 changes_json() { # JSON array perubahan sejak baseline + temuan langsung (program di /tmp, koneksi penambang)
     local now base out='' n=0 typ item sig old p f rest
     if [ ! -f "$BASELINE" ]; then baseline_save; printf '[]'; return 0; fi
+    # Jenis yang baru dipantau versi ini (baseline dari versi lama belum memuatnya): catat
+    # diam-diam sebagai normal, jangan dilaporkan sebagai "baru" semuanya.
+    for typ in suid port; do grep -q "^$typ|" "$BASELINE" || baseline_save "$typ"; done
     now="$(snapshot | sort -u)"; base="$(grep -v '^#' "$BASELINE" || true)"
     while IFS='|' read -r typ item sig; do
         [ -n "$typ" ] || continue
