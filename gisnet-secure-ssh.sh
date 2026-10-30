@@ -60,7 +60,7 @@ set -euo pipefail
 # dianggap tidak ada saat perintah datang dari aplikasi (ditemukan 2026-10-29 di server NMS).
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:$PATH}"
 
-SCRIPT_VERSION='2.24'
+SCRIPT_VERSION='2.25'
 SELF_INSTALL=/usr/local/sbin/gisnet-secure-ssh
 STATE_DIR=/etc/gisnet-secure-ssh
 REPORT_CONF="$STATE_DIR/report.conf"
@@ -1258,8 +1258,13 @@ time_json() { # {"synced":bool|null,"ntp":bool|null,"offset_ms":angka|null,"sour
 ROOTKIT_RESULT="$STATE_DIR/rootkit.json"
 ROOTKIT_EVERY=604800
 # Naikkan bila daftar pengecualian di rkhunter_conf_local berubah -> semua server memindai ulang sekali.
-ROOTKIT_CONF_VER=3
+ROOTKIT_CONF_VER=4
 RKHUNTER_LOCAL=/etc/rkhunter.conf.local
+# 2.25: peringatan yang tidak bisa dipercaya & sudah diperiksa sendiri oleh skrip ini:
+#  - aturan login root: rkhunter salah membaca sshd_config.d (Kulo: "yes", padahal sshd -T =
+#    prohibit-password) -- skrip ini melaporkan aturan sebenarnya (ssh.root_login);
+#  - /usr/libexec/gawk di AlmaLinux 10 adalah symlink -> rkhunter tidak bisa menyimpan sidik jarinya.
+ROOTKIT_IGNORE_RE="SSH and rkhunter configuration options should be the same|SSH configuration option 'PermitRootLogin' has not been set|No hash value found for file '/usr/libexec/gawk'"
 rkhunter_conf_local() { # peringatan palsu yang umum (Debian/Ubuntu/RHEL) -- file dikelola skrip ini
     [ -f "$RKHUNTER_LOCAL" ] && ! grep -q '^# gisnet-secure-ssh' "$RKHUNTER_LOCAL" && return 0  # buatan admin: jangan disentuh
     local root
@@ -1316,7 +1321,7 @@ rootkit_scan() { # dijalankan di latar belakang; menulis $ROOTKIT_RESULT
         [ -n "$line" ] || continue
         warn=$((warn + 1))
         [ "$n" -lt 10 ] && { items="$items${items:+,}$(json_str "${line:0:200}")"; n=$((n + 1)); }
-    done < <(grep -E 'Warning:|INFECTED|Possible|suspicious|Vulnerable' <<< "$out" || true)
+    done < <(grep -E 'Warning:|INFECTED|Possible|suspicious|Vulnerable' <<< "$out" | grep -vE "$ROOTKIT_IGNORE_RE" || true)
     printf '{"tool":"%s","at":%s,"warnings":%d,"items":[%s]}' "$tool" "$(date +%s)" "$warn" "$items" > "$ROOTKIT_RESULT.tmp"
     mv -f "$ROOTKIT_RESULT.tmp" "$ROOTKIT_RESULT"
     echo "$ROOTKIT_CONF_VER" > "$STATE_DIR/rootkit-conf"
