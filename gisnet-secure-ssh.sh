@@ -60,7 +60,7 @@ set -euo pipefail
 # dianggap tidak ada saat perintah datang dari aplikasi (ditemukan 2026-10-29 di server NMS).
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:$PATH}"
 
-SCRIPT_VERSION='2.22'
+SCRIPT_VERSION='2.23'
 SELF_INSTALL=/usr/local/sbin/gisnet-secure-ssh
 STATE_DIR=/etc/gisnet-secure-ssh
 REPORT_CONF="$STATE_DIR/report.conf"
@@ -1202,9 +1202,10 @@ snapshot() { # cetak "jenis|item|sidik" -- cron, layanan systemd di /etc, user l
     }'
 }
 scanner_owned() { # file milik paket rkhunter/chkrootkit (dpkg/rpm)?
+    # dpkg & rpm dicoba keduanya: server RHEL/cPanel bisa saja punya dpkg-query juga (Kulo/Iwak/Eson 2.20-2.22).
     local o=''
-    if have dpkg-query; then o="$(dpkg-query -S "$1" 2>/dev/null || true)"; o="${o%%:*}"
-    elif have rpm; then o="$(rpm -qf --qf '%{NAME}' "$1" 2>/dev/null || true)"; fi
+    have dpkg-query && { o="$(dpkg-query -S "$1" 2>/dev/null || true)"; o="${o%%:*}"; }
+    [ -z "$o" ] && have rpm && o="$(rpm -qf --qf '%{NAME}' "$1" 2>/dev/null || true)"
     case "$o" in rkhunter|chkrootkit) return 0 ;; *) return 1 ;; esac
 }
 suid_list() { find / -xdev \( -path /proc -o -path /sys -o -path /run -o -path /snap \) -prune -o -type f -perm -4000 -print 2>/dev/null | sort | head -300; }
