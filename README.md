@@ -172,6 +172,8 @@ Saat pertama dijalankan, skrip mencatat kondisi normal: jadwal **cron**, **layan
 
 Mulai v2.16 juga dipantau: **program SUID** baru dan **port** yang baru menerima koneksi dari internet. Setiap jam skrip juga mencoba mengunduh file rahasia (`.env`, `.git/config`, phpinfo, backup `.sql`) dari semua situs di server itu -- hanya yang benar-benar bisa diunduh yang dilaporkan -- dan memeriksa **sertifikat SSL** (web, mail, cPanel) yang habis kurang dari 21 hari.
 
+Mulai v2.18 juga dilaporkan **jam server** (tersinkron NTP atau tidak, dan selisihnya; dibaca dari chrony / systemd-timesyncd / ntpd) serta hasil **pemindaian rootkit mingguan**. Pemindaian memakai `rkhunter` (dipasang otomatis bila belum ada; cadangan `chkrootkit`), berjalan di latar belakang dengan prioritas rendah sekali seminggu, dan basis data file-nya hanya diperbarui bila ada paket yang berubah. Jalankan manual: `gisnet-secure-ssh rootkit-scan`. rkhunter kadang memberi peringatan palsu -- periksa `/var/log/rkhunter.log`.
+
 ### Batasi port berbahaya (mulai v2.15)
 
 ```bash

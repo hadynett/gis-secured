@@ -45,6 +45,7 @@
 #     dns [show|set <ip> .. (maks 3, 4 bila systemd-resolved)]  lihat / ganti DNS server (diuji, batal otomatis bila gagal)
 #     baseline [show|accept]                 jejak penyusup: cron/layanan/user/kunci/SUID/port baru sejak kondisi normal
 #     restrict [list|add <port>|remove <port>]   batasi port berbahaya (mis. 3306) ke server ini sendiri
+#     rootkit-scan                           pindai rootkit sekarang (otomatis seminggu sekali, rkhunter/chkrootkit)
 #     update [--check] [--force]             perbarui skrip ke versi terbaru, pengaturan tetap
 #     checks                                 pemeriksaan: kesehatan, port terbuka, proses, login SSH (JSON)
 #
@@ -59,7 +60,7 @@ set -euo pipefail
 # dianggap tidak ada saat perintah datang dari aplikasi (ditemukan 2026-10-29 di server NMS).
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:$PATH}"
 
-SCRIPT_VERSION='2.17'
+SCRIPT_VERSION='2.18'
 SELF_INSTALL=/usr/local/sbin/gisnet-secure-ssh
 STATE_DIR=/etc/gisnet-secure-ssh
 REPORT_CONF="$STATE_DIR/report.conf"
@@ -1143,12 +1144,12 @@ checks_fields() { # potongan JSON (tanpa kurung kurawal) -- dipakai laporan & pe
     logins="$(checks_logins)"
     web="$(cat "$WEB_PROXY_STATE" 2>/dev/null || true)"
     jails="$( { fail2ban-client status 2>/dev/null | sed -n 's/.*Jail list:[[:space:]]*//p' | tr -d ' ' | tr ',' '\n' | grep -vxE 'sshd|recidive|gisnet-scan|gisnet-shared|' || true; } | awk '{printf "%s\"%s\"", (NR>1?",":""), $0}')"
-    printf '"health":%s,"open_ports":%s,"suspicious":%s,"logins":%s,"logins_7d":%s,"web_proxy":%s,"service_jails":[%s],"changes":%s,"baseline_at":%s,"restricted_ports":[%s],"web_leaks":%s,"certs":%s,%s' \
+    printf '"health":%s,"open_ports":%s,"suspicious":%s,"logins":%s,"logins_7d":%s,"web_proxy":%s,"service_jails":[%s],"changes":%s,"baseline_at":%s,"restricted_ports":[%s],"web_leaks":%s,"certs":%s,%s,"time":%s,"rootkit":%s' \
         "$(checks_health)" "$(checks_ports)" "$(checks_processes)" "${logins%|*}" "${logins##*|}" \
         "$([ -n "$web" ] && json_str "$web" || echo null)" "$jails" \
         "$(changes_json)" "$(sed -n 's/^# baseline //p' "$BASELINE" 2>/dev/null | head -1 | grep -E '^[0-9]+$' || echo null)" \
         "$(restricted_ports | paste -sd, -)" \
-        "$(web_leaks_json)" "$(certs_json)" "$(ssh_fail_fields)"
+        "$(web_leaks_json)" "$(certs_json)" "$(ssh_fail_fields)" "$(time_json)" "$(rootkit_json)"
 }
 cmd_checks() { # cetak hasil pemeriksaan sebagai JSON (dipakai skrip status VM aplikasi)
     detect_os
@@ -1217,6 +1218,73 @@ ssh_fail_fields() { # potongan JSON: "ssh_fail_1h":N,"ssh_fail_24h":N,"ssh_fail_
     top="$(awk '{ for (i = 2; i <= NF; i++) if ($i == "port" && $(i-1) ~ /^[0-9a-fA-F.:]+$/ && $(i-1) ~ /[.:]/) { print $(i-1); break } }' <<< "$h1" \
         | sort | uniq -c | sort -rn | head -3 | awk '{printf "%s{\"ip\":\"%s\",\"count\":%d}", (NR>1?",":""), $2, $1}')"
     printf '"ssh_fail_1h":%d,"ssh_fail_24h":%d,"ssh_fail_top":[%s]' "$(grep -c . <<< "$h1" || true)" "${h24:-0}" "$top"
+}
+
+# ============================================ JAM & ROOTKIT (2.18) ===
+time_json() { # {"synced":bool|null,"ntp":bool|null,"offset_ms":angka|null,"source":"..."}
+    local synced=null ntp=null off=null src=none v
+    if have timedatectl && [ "${HAS_SYSTEMD:-0}" -eq 1 ]; then
+        v="$(timedatectl show -p NTPSynchronized --value 2>/dev/null || true)"; [ "$v" = yes ] && synced=true; [ "$v" = no ] && synced=false
+        v="$(timedatectl show -p NTP --value 2>/dev/null || true)"; [ "$v" = yes ] && ntp=true; [ "$v" = no ] && ntp=false
+    fi
+    if have chronyc && v="$(chronyc -n tracking 2>/dev/null)" && [ -n "$v" ]; then
+        src=chrony
+        off="$(awk -F': *' '/^System time/{ split($2, a, " "); s = a[1] * 1000; if (a[3] == "slow") s = -s; printf "%.1f", s }' <<< "$v")"
+    elif have timedatectl && v="$(timedatectl timesync-status 2>/dev/null)" && [ -n "$v" ]; then
+        src=timesyncd
+        off="$(awk '/Offset:/{ x = $2; m = 1; if (x ~ /us$/) m = 0.001; else if (x ~ /ms$/) m = 1; else if (x ~ /s$/) m = 1000; gsub(/[^0-9.+-]/, "", x); printf "%.1f", x * m }' <<< "$v")"
+    elif have ntpq && ntpq -pn >/dev/null 2>&1; then
+        src=ntpd
+        off="$(ntpq -pn 2>/dev/null | awk '/^\*/{ printf "%.1f", $9 }')"
+    fi
+    printf '{"synced":%s,"ntp":%s,"offset_ms":%s,"source":"%s"}' "$synced" "$ntp" "${off:-null}" "$src"
+}
+
+# Pemindaian rootkit seminggu sekali, di LATAR BELAKANG (rkhunter bisa beberapa menit);
+# laporan hanya membaca hasil terakhir. Sidik jari file (--propupd) hanya diperbarui bila
+# ada update paket sejak pemindaian lalu -- supaya update sistem tidak jadi peringatan palsu.
+ROOTKIT_RESULT="$STATE_DIR/rootkit.json"
+ROOTKIT_EVERY=604800
+rootkit_last_pkg_change() { # epoch perubahan paket terakhir (dpkg/dnf/yum)
+    local t=0 f
+    for f in /var/log/dpkg.log /var/lib/dpkg/status /var/lib/rpm/rpmdb.sqlite /var/lib/rpm/Packages /var/log/dnf.rpm.log; do
+        [ -e "$f" ] && t=$(( $(stat -c %Y "$f" 2>/dev/null || echo 0) > t ? $(stat -c %Y "$f" 2>/dev/null || echo 0) : t ))
+    done
+    echo "$t"
+}
+rootkit_scan() { # dijalankan di latar belakang; menulis $ROOTKIT_RESULT
+    local tool='' out warn=0 items='' line n=0 stamp="$STATE_DIR/rootkit-propupd"
+    have rkhunter || pkg_install rkhunter >/dev/null 2>&1 || true
+    if have rkhunter; then
+        tool=rkhunter
+        if [ ! -f "$stamp" ] || [ "$(rootkit_last_pkg_change)" -gt "$(stat -c %Y "$stamp" 2>/dev/null || echo 0)" ]; then
+            rkhunter --propupd --nocolors >/dev/null 2>&1 || true; touch "$stamp"
+        fi
+        out="$(rkhunter --check --sk --nocolors --rwo 2>/dev/null || true)"
+    else
+        have chkrootkit || pkg_install chkrootkit >/dev/null 2>&1 || true
+        if have chkrootkit; then tool=chkrootkit; out="$(chkrootkit -q 2>/dev/null || true)"; fi
+    fi
+    if [ -z "$tool" ]; then
+        printf '{"tool":null,"at":%s,"warnings":0,"items":[]}' "$(date +%s)" > "$ROOTKIT_RESULT"; return 0
+    fi
+    while IFS= read -r line; do
+        line="$(sed 's/^[[:space:]]*//; s/[[:space:]]*$//' <<< "$line")"
+        [ -n "$line" ] || continue
+        warn=$((warn + 1))
+        [ "$n" -lt 10 ] && { items="$items${items:+,}$(json_str "${line:0:200}")"; n=$((n + 1)); }
+    done < <(grep -E 'Warning:|INFECTED|Possible|suspicious|Vulnerable' <<< "$out" || true)
+    printf '{"tool":"%s","at":%s,"warnings":%d,"items":[%s]}' "$tool" "$(date +%s)" "$warn" "$items" > "$ROOTKIT_RESULT.tmp"
+    mv -f "$ROOTKIT_RESULT.tmp" "$ROOTKIT_RESULT"
+}
+rootkit_json() { # hasil terakhir; jalankan pemindaian baru di latar belakang bila sudah > 7 hari
+    local age=999999999
+    [ -f "$ROOTKIT_RESULT" ] && age=$(( $(date +%s) - $(stat -c %Y "$ROOTKIT_RESULT" 2>/dev/null || echo 0) ))
+    if [ "$age" -ge "$ROOTKIT_EVERY" ] && [ -w "$STATE_DIR" ] && [ "$(id -u)" -eq 0 ] && [ -f "$SELF_INSTALL" ] \
+       && ! pgrep -f "gisnet-secure-ssh rootkit-scan" >/dev/null 2>&1; then
+        ( GISNET_NONINTERACTIVE=1 nohup nice -n 15 "$SELF_INSTALL" rootkit-scan </dev/null >/dev/null 2>&1 & ) 2>/dev/null || true
+    fi
+    if [ -f "$ROOTKIT_RESULT" ]; then cat "$ROOTKIT_RESULT"; else printf 'null'; fi
 }
 
 # ============================================ WEBSITE & SERTIFIKAT (2.16) ===
@@ -1984,6 +2052,7 @@ case "${1-}" in
     dns)                  shift; cmd_dns "$@" ;;
     baseline)             shift; cmd_baseline "$@" ;;
     restrict|batasi)      shift; cmd_restrict "$@" ;;
+    rootkit-scan)         shift; need_root; detect_os; rootkit_scan; cat "$ROOTKIT_RESULT"; echo ;;
     restore)              shift; cmd_restore "$@" ;;
     report|laporan)       shift; cmd_report "$@" ;;
     checks|periksa)       shift; cmd_checks ;;
