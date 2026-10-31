@@ -44,7 +44,8 @@
 #     report shared-blocklist on|off         blokir bersama: IP penyerang dari server GISNET lain
 #     dns [show|set <ip> .. (maks 3, 4 bila systemd-resolved)]  lihat / ganti DNS server (diuji, batal otomatis bila gagal)
 #     baseline [show|accept]                 jejak penyusup: cron/layanan/user/kunci/SUID/port baru sejak kondisi normal
-#     restrict [list|add <port>|remove <port>]   batasi port berbahaya (mis. 3306) ke server ini sendiri
+#     restrict [list|add <port> [ip,ip..]|remove <port>]   batasi port berbahaya (mis. 3306) ke server ini sendiri
+#                                            + IP/CIDR lain yang diizinkan (2.28, mis. billing/NMS untuk NBI ACS)
 #     rootkit-scan                           pindai rootkit sekarang (otomatis seminggu sekali, rkhunter/chkrootkit)
 #     update [--check] [--force]             perbarui skrip ke versi terbaru, pengaturan tetap
 #     checks                                 pemeriksaan: kesehatan, port terbuka, proses, login SSH (JSON)
@@ -60,7 +61,7 @@ set -euo pipefail
 # dianggap tidak ada saat perintah datang dari aplikasi (ditemukan 2026-10-29 di server NMS).
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:$PATH}"
 
-SCRIPT_VERSION='2.27'
+SCRIPT_VERSION='2.28'
 SELF_INSTALL=/usr/local/sbin/gisnet-secure-ssh
 STATE_DIR=/etc/gisnet-secure-ssh
 REPORT_CONF="$STATE_DIR/report.conf"
@@ -1185,11 +1186,11 @@ checks_fields() { # potongan JSON (tanpa kurung kurawal) -- dipakai laporan & pe
     logins="$(checks_logins)"
     web="$(cat "$WEB_PROXY_STATE" 2>/dev/null || true)"
     jails="$( { fail2ban-client status 2>/dev/null | sed -n 's/.*Jail list:[[:space:]]*//p' | tr -d ' ' | tr ',' '\n' | grep -vxE 'sshd|recidive|gisnet-scan|gisnet-shared|' || true; } | awk '{printf "%s\"%s\"", (NR>1?",":""), $0}')"
-    printf '"health":%s,"open_ports":%s,"suspicious":%s,"logins":%s,"logins_7d":%s,"web_proxy":%s,"service_jails":[%s],"changes":%s,"baseline_at":%s,"restricted_ports":[%s],"web_leaks":%s,"certs":%s,%s,"time":%s,"rootkit":%s' \
+    printf '"health":%s,"open_ports":%s,"suspicious":%s,"logins":%s,"logins_7d":%s,"web_proxy":%s,"service_jails":[%s],"changes":%s,"baseline_at":%s,"restricted_ports":[%s],"restrict_rules":%s,"web_leaks":%s,"certs":%s,%s,"time":%s,"rootkit":%s' \
         "$(checks_health)" "$(checks_ports)" "$(checks_processes)" "${logins%|*}" "${logins##*|}" \
         "$([ -n "$web" ] && json_str "$web" || echo null)" "$jails" \
         "$(changes_json)" "$(sed -n 's/^# baseline //p' "$BASELINE" 2>/dev/null | head -1 | grep -E '^[0-9]+$' || echo null)" \
-        "$(restricted_ports | paste -sd, -)" \
+        "$(restricted_ports | paste -sd, -)" "$(restrict_rules_json)" \
         "$(web_leaks_json)" "$(certs_json)" "$(ssh_fail_fields)" "$(time_json)" "$(rootkit_json)"
 }
 cmd_checks() { # cetak hasil pemeriksaan sebagai JSON (dipakai skrip status VM aplikasi)
@@ -1506,33 +1507,52 @@ cmd_baseline() {
 # ========================================= BATASI PORT BERBAHAYA (2.15) ===
 # Port (mis. 3306) hanya boleh diakses dari server ini sendiri: tabel nftables sendiri
 # "gisnet_restrict" + layanan systemd supaya tetap berlaku setelah reboot.
+# 2.28: tiap port boleh membawa daftar IP/CIDR lain yang diizinkan (mis. NBI GenieACS untuk
+# billing & NMS). Format berkas: satu baris per port -> "<port>" atau "<port> ip,ip,cidr".
 RESTRICT_LIST="$STATE_DIR/restricted-ports"
 RESTRICT_NFT="$STATE_DIR/restrict.nft"
 RESTRICT_UNIT=/etc/systemd/system/gisnet-restrict.service
-restricted_ports() { sort -un "$RESTRICT_LIST" 2>/dev/null | grep -E '^[0-9]+$' || true; }
+restricted_ports() { awk '$1 ~ /^[0-9]+$/ {print $1}' "$RESTRICT_LIST" 2>/dev/null | sort -un || true; }
+restrict_allow() { # IP diizinkan untuk satu port, dipisah koma (kosong = hanya server ini)
+    awk -v p="$1" '$1 == p {a = $2} END {print a}' "$RESTRICT_LIST" 2>/dev/null || true
+}
+restrict_rules_json() { # [{"port":N,"allow":["ip",..]},..]
+    local p a out='' items
+    for p in $(restricted_ports); do
+        a="$(restrict_allow "$p")"
+        items="$(tr ',' '\n' <<< "$a" | grep -v '^$' | awk '{printf "%s\"%s\"", (NR>1?",":""), $0}' || true)"
+        out="$out${out:+,}{\"port\":$p,\"allow\":[$items]}"
+    done
+    echo "[$out]"
+}
 restrict_apply() { # tulis & muat aturan dari daftar port
     have nft || { c_warn "nft tidak tersedia -- port tidak bisa dibatasi otomatis."; return 1; }
-    local ports v4 v6 list
-    list="$(restricted_ports | paste -sd, - | sed 's/,/, /g')"
-    if [ -z "$list" ]; then
+    local p a v4 v6 a4 a6 s4 s6 summary=''
+    if [ -z "$(restricted_ports)" ]; then
         nft delete table inet gisnet_restrict 2>/dev/null || true
         rm -f "$RESTRICT_NFT"; systemctl disable --now gisnet-restrict.service >/dev/null 2>&1 || true; rm -f "$RESTRICT_UNIT"
         systemctl daemon-reload >/dev/null 2>&1 || true
         return 0
     fi
-    v4="$(hostname -I 2>/dev/null | tr ' ' '\n' | grep -E '^[0-9]+\.' | paste -sd, - | sed 's/,/, /g')"
-    v6="$(ip -6 addr show scope global 2>/dev/null | awk '/inet6/{sub(/\/.*/,"",$2); print $2}' | paste -sd, - | sed 's/,/, /g')"
+    v4="$(hostname -I 2>/dev/null | tr ' ' '\n' | grep -E '^[0-9]+\.' || true)"
+    v6="$(ip -6 addr show scope global 2>/dev/null | awk '/inet6/{sub(/\/.*/,"",$2); print $2}' || true)"
     {
-        echo "# gis-secured: port berbahaya hanya dari server ini sendiri (dibuat $(date '+%Y-%m-%d %H:%M'))"
+        echo "# gis-secured: port berbahaya hanya dari server ini sendiri + IP yang diizinkan (dibuat $(date '+%Y-%m-%d %H:%M'))"
         echo "table inet gisnet_restrict"
         echo "delete table inet gisnet_restrict"
         echo "table inet gisnet_restrict {"
         echo "    chain input {"
         echo "        type filter hook input priority -5; policy accept;"
-        echo "        tcp dport { $list } iifname \"lo\" accept"
-        [ -n "$v4" ] && echo "        tcp dport { $list } ip saddr { $v4 } accept"
-        [ -n "$v6" ] && echo "        tcp dport { $list } ip6 saddr { $v6 } accept"
-        echo "        tcp dport { $list } drop"
+        for p in $(restricted_ports); do
+            a="$(restrict_allow "$p" | tr ',' '\n' | grep -v '^$' || true)"
+            a4="$(grep -v ':' <<< "$a" || true)"; a6="$(grep ':' <<< "$a" || true)"
+            s4="$(printf '%s\n%s\n' "$v4" "$a4" | grep -v '^$' | sort -u | paste -sd, - | sed 's/,/, /g' || true)"
+            s6="$(printf '%s\n%s\n' "$v6" "$a6" | grep -v '^$' | sort -u | paste -sd, - | sed 's/,/, /g' || true)"
+            echo "        tcp dport $p iifname \"lo\" accept"
+            [ -n "$s4" ] && echo "        tcp dport $p ip saddr { $s4 } accept"
+            [ -n "$s6" ] && echo "        tcp dport $p ip6 saddr { $s6 } accept"
+            echo "        tcp dport $p drop"
+        done
         echo "    }"
         echo "}"
     } > "$RESTRICT_NFT.tmp"
@@ -1545,32 +1565,49 @@ restrict_apply() { # tulis & muat aturan dari daftar port
         systemctl daemon-reload >/dev/null 2>&1 || true
         systemctl enable gisnet-restrict.service >/dev/null 2>&1 || true
     fi
-    c_ok "Port dibatasi ke server ini sendiri: $list."
+    for p in $(restricted_ports); do a="$(restrict_allow "$p")"; summary="$summary $p${a:+ (+$a)}"; done
+    c_ok "Port dibatasi ke server ini sendiri:$summary."
 }
-cmd_restrict() { # restrict [list | add <port> | remove <port>]
+restrict_clean_allow() { # validasi daftar IP (koma) -> daftar bersih, atau gagal
+    local ip out=''
+    for ip in $(tr ',' ' ' <<< "$1"); do
+        valid_ip "$ip" || { c_err "IP tidak valid: $ip"; return 1; }
+        if wl_too_wide "$ip"; then c_err "Terlalu luas: $ip (minimal /16 IPv4, /32 IPv6)"; return 1; fi
+        case ",$out," in *",$ip,"*) ;; *) out="$out${out:+,}$ip" ;; esac
+    done
+    [ "$(tr ',' '\n' <<< "$out" | grep -c . || true)" -le 20 ] || { c_err "Maksimal 20 IP per port."; return 1; }
+    printf '%s' "$out"
+}
+cmd_restrict() { # restrict [list | add <port> [ip,ip..] | remove <port>]
     need_root; detect_os
-    local p="${2-}"
+    local p="${2-}" a allow=''
     case "${1-list}" in
-        list|''|lihat) echo " Port dibatasi: $(restricted_ports | paste -sd' ' - | sed 's/^$/(tidak ada)/')" ;;
+        list|''|lihat)
+            if [ -z "$(restricted_ports)" ]; then echo " Port dibatasi: (tidak ada)"
+            else echo " Port dibatasi:"; for p in $(restricted_ports); do a="$(restrict_allow "$p")"; echo "   $p${a:+  + $a}"; done; fi ;;
         add|tambah|remove|hapus)
             [[ "$p" =~ ^[0-9]+$ ]] && [ "$p" -ge 1 ] && [ "$p" -le 65535 ] || die "Port tidak valid: ${p:-kosong}"
             case ",$(ssh_ports)," in *",$p,"*) die "Port $p dipakai SSH -- tidak boleh dibatasi (server bisa terkunci)." ;; esac
+            if [ "$1" = add ] || [ "$1" = tambah ]; then
+                allow="$(restrict_clean_allow "${3-}")" || die "Daftar IP ditolak -- port tidak diubah."
+            fi
             mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR"; touch "$RESTRICT_LIST"
-            if [ "$1" = add ] || [ "$1" = tambah ]; then echo "$p" >> "$RESTRICT_LIST"
-            else grep -vx "$p" "$RESTRICT_LIST" > "$RESTRICT_LIST.tmp" || true; mv -f "$RESTRICT_LIST.tmp" "$RESTRICT_LIST"; fi
-            restricted_ports > "$RESTRICT_LIST.tmp"; mv -f "$RESTRICT_LIST.tmp" "$RESTRICT_LIST"
+            awk -v p="$p" '$1 != p' "$RESTRICT_LIST" > "$RESTRICT_LIST.tmp" || true
+            if [ "$1" = add ] || [ "$1" = tambah ]; then echo "$p${allow:+ $allow}" >> "$RESTRICT_LIST.tmp"; fi
+            sort -n "$RESTRICT_LIST.tmp" > "$RESTRICT_LIST"; rm -f "$RESTRICT_LIST.tmp"
             restrict_apply ;;
-        *) die "Perintah restrict tidak dikenal (list | add <port> | remove <port>)" ;;
+        *) die "Perintah restrict tidak dikenal (list | add <port> [ip,ip..] | remove <port>)" ;;
     esac
 }
-report_apply_restrict() { # {"port_restrict":{"action":"add|remove","port":N}} -- perlu izin port
-    local m action port
-    m="$(printf '%s' "$1" | grep -oE '"port_restrict" *: *\{ *"action" *: *"(add|remove)" *, *"port" *: *[0-9]{1,5} *\}' | head -1 || true)"
+report_apply_restrict() { # {"port_restrict":{"action":"add|remove","port":N[,"allow":"ip,ip"]}} -- perlu izin port
+    local m action port allow=''
+    m="$(printf '%s' "$1" | grep -oE '"port_restrict" *: *\{ *"action" *: *"(add|remove)" *, *"port" *: *[0-9]{1,5} *(, *"allow" *: *"[0-9A-Fa-f:.,/]*" *)?\}' | head -1 || true)"
     [ -n "$m" ] || return 0
     if [ ! -f "$ALLOW_PORT" ]; then c_warn "Aplikasi meminta batasi port, tetapi server ini tidak mengizinkan (report allow-port on)."; return 0; fi
     action="$(sed -E 's/.*"action" *: *"([a-z]+)".*/\1/' <<< "$m")"; port="$(sed -E 's/.*"port" *: *([0-9]+).*/\1/' <<< "$m")"
-    logger -t gisnet-secure-ssh "batasi port $action $port diminta dari aplikasi" 2>/dev/null || true
-    ( cmd_restrict "$action" "$port" ) >> /var/log/gisnet-secure-ssh-restrict.log 2>&1 || true
+    if grep -q '"allow"' <<< "$m"; then allow="$(sed -E 's/.*"allow" *: *"([^"]*)".*/\1/' <<< "$m")"; fi
+    logger -t gisnet-secure-ssh "batasi port $action $port${allow:+ izinkan $allow} diminta dari aplikasi" 2>/dev/null || true
+    ( cmd_restrict "$action" "$port" "$allow" ) >> /var/log/gisnet-secure-ssh-restrict.log 2>&1 || true
     ( GISNET_NONINTERACTIVE=1 "$SELF_INSTALL" report now quiet </dev/null >/dev/null 2>&1 & ) 2>/dev/null || true
 }
 report_apply_baseline() { # {"baseline_accept":true} -- tandai kondisi sekarang normal (izin whitelist/port)
